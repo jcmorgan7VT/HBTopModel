@@ -1,0 +1,657 @@
+---
+title: "HB_dynatop"
+format: html
+editor_options: 
+  chunk_output_type: console
+---
+
+Model runs, but there is something weird going on. The result is always extremely low. I believe units are correct.
+
+```{r}
+library(pacman)
+p_load(terra, dynatop, dynatopGIS, xts, whitebox, tidyverse,
+       sf, # working with st and sf objects
+       tidyterra, # do tidy ops on terra objects
+       sfnetworks # create start and end nodes for channel network
+       )
+setwd("./hb_data")
+```
+
+```{r}
+# Try reading my own version of dynatop
+devtools::load_all(file.path(".","packages", "dynatop-master")) ## attach the revised package
+
+```
+
+
+# GIS PREP
+```{r GIS files}
+dem_path <- file.path(".", "unprocessed",
+                      "1m hydro enforced dem","hydem1mlpns.tif")
+dem <- rast(dem_path) # load the dem as a raster layer
+plot(dem)
+
+# crop DEM to a rough rectangle
+ybounds <- c(4870350,4871350)
+xbounds <- c(281350, 282150)
+crop1 <- crop(dem, ext(c(xbounds, ybounds)))
+plot(crop1)
+crop_dem_path <- file.path(".", "unprocessed",
+                      "1m hydro enforced dem","hydem1mlpns.tif")
+writeRaster(crop1, crop_dem_path, overwrite = TRUE)
+####delineate watershed and keep watershed boundary
+
+w3_breached <- "./unprocessed/whitebox_outputs/1mdem_breach.tif"
+wbt_breach_depressions_least_cost(
+  dem = crop_dem_path,
+  output = w3_breached,
+  dist = 1,
+  fill = TRUE)
+
+w3_filled <- "./unprocessed/whitebox_outputs/1mdem_fill.tif"
+wbt_fill_depressions_wang_and_liu(
+  dem = w3_breached,
+  output = w3_filled
+)
+#calculate flow accumulation and direction
+w3_flowacc <- "./unprocessed/whitebox_outputs/1mdem_w3_flowacc.tif"
+wbt_d8_flow_accumulation(input = w3_filled,
+                         output = w3_flowacc)
+w3_d8pt <- "./unprocessed/whitebox_outputs/1mdem_w3_d8pt.tif"
+wbt_d8_pointer(dem = w3_filled,
+               output = w3_d8pt)
+
+#delineate streams
+w3_streams <- "./unprocessed/whitebox_outputs/w3_streams.tif"
+wbt_extract_streams(flow_accum = w3_flowacc,
+                    output = w3_streams,
+                    threshold = 8000)
+plot(rast(w3_streams))
+
+# convert streams to shapefile
+w3_streams_vect <- "./unprocessed/whitebox_outputs/w3_streams_vect.shp"
+wbt_raster_streams_to_vector(streams = w3_streams,
+                             d8_pntr = w3_d8pt,
+                             output = w3_streams_vect)
+
+# get pour point ready
+pour_point_path <- file.path(".", 
+                             "unprocessed",
+                             "1m hydro enforced dem", "w3_pour_snap.shp")
+plot(vect(pour_point_path), add = TRUE)
+
+w3_pour_snap <- "./unprocessed/whitebox_outputs/w3_pour_snap.shp"
+wbt_jenson_snap_pour_points(pour_pts = pour_point_path,
+                            streams = w3_streams,
+                            output = w3_pour_snap,
+                            snap_dist = 10)
+w3_pour_snap_read <- vect(w3_pour_snap)
+plot(rast(w3_streams), 
+     xlim = c(281400, 282000),
+     ylim = c(4870400, 4870800))
+points(w3_pour_snap_read, pch = 1)
+
+
+w3_shed <- "./unprocessed/whitebox_outputs/w3_shed.tif"
+wbt_watershed(d8_pntr = w3_d8pt,
+              pour_pts = w3_pour_snap,
+              output = w3_shed)
+
+plot(rast(w3_shed))
+#convert raster of watershed area to vector for final mapping
+w3_outline <- as.polygons(rast(w3_shed), extent=FALSE)
+plot(w3_outline)
+
+plot(w3_outline)
+
+channel <- vect(w3_streams_vect) %>% 
+  crop(w3_outline)
+
+
+# crop and mask DEM by watershed outline
+dem_crop_mask <- rast(w3_filled) %>% 
+  crop(w3_outline) %>% 
+  mask(w3_outline)
+
+#create watershed area, just use area of DEM
+outline <- (dem_crop_mask * 0) + 1
+# extend both rasters by 1 pixel
+outline_extended <- extend(outline,1)
+dem_final <- extend(dem_crop_mask,1)
+
+
+writeRaster(outline_extended,file.path(".","processed","w3.tif"),overwrite=TRUE)
+writeRaster(dem_final,file.path(".","processed","dem.tif"),overwrite=TRUE)
+```
+```{r convert channel}
+plot(channel)
+
+# 2. Break multipart lines into individual components
+# This converts MULTILINESTRING to LINESTRING
+single_parts <- st_cast(as_sf(channel), "LINESTRING")
+
+# 3. View the new, broken-down data
+print(single_parts)
+plot(single_parts)
+coords <- st_coordinates(single_parts)
+
+
+library(sfnetworks)
+
+net <- as_sfnetwork(single_parts, directed = TRUE)
+
+# Extract nodes
+nodes <- st_as_sf(net, "nodes")
+
+# Extract edges
+edges <- st_as_sf(net, "edges")
+
+edges$length_m <- st_length(edges)
+test <- edges %>% 
+  select(from, to, geometry, length_m) %>% 
+  mutate("Identifier" = dplyr::row_number()) %>% 
+  vect() %>% 
+  terra::project("EPSG:26919") %>% 
+  crop(dem)
+
+conv_channel <- convert_channel(
+    test,
+    property_names = c(name = "Identifier", 
+                       length = "length_m", startNode = "from",
+                       endNode= "to"),
+    default_width = 2,
+    default_slope = 0.001
+)
+
+writeVector(conv_channel,file.path(".","processed","channel.shp"),overwrite=TRUE)
+```
+
+Create in the same resolution rasters of:
+- watershed shape
+- DEM
+Shapefile of:
+- pour point/gauge location
+- channel
+```{r aggregating/changing spatial res}
+aggreg_factor <- 10
+#start with hydro enforced DEM
+one <- rast(file.path(".", "unprocessed","1m hydro enforced dem", "hydem1mlpns.tif"))
+#delineate watershed
+
+####delineate watershed and keep watershed boundary
+ybounds <- c(4870350,4871350)
+xbounds <- c(281350, 282150)
+plot(one, xlim = xbounds, ylim = ybounds)
+#create a SpatExtent from a vector 
+m10 <- aggregate(one, aggreg_factor)
+
+crop10 <- crop(m10, ext(c(xbounds, ybounds)))
+#save cropped 1m dem to reduce processing time below, and guarantee that everything has the same extent
+writeRaster(crop10, 
+            file.path(".", 
+                      "unprocessed",
+                      "1m hydro enforced dem", 
+                      "hydem10mlpns_crop.tif"), 
+            overwrite = TRUE)
+
+#read in cropped dem
+w3_crop <- file.path(".", 
+                      "unprocessed",
+                      "1m hydro enforced dem", 
+                      "hydem10mlpns_crop.tif")
+#calculate flow accumulation and direction
+w3_flowacc <- file.path(".", 
+                      "unprocessed",
+                      "1m hydro enforced dem", 
+                      "hydem10mlpns_flowacc.tif")
+wbt_d8_flow_accumulation(input = w3_crop,
+                         output = w3_flowacc)
+plot(rast(w3_flowacc))
+
+w3_d8pt <- file.path(".", 
+                      "unprocessed",
+                      "1m hydro enforced dem", 
+                      "hydem10mlpns_d8pt.tif")
+wbt_d8_pointer(dem = w3_crop,
+               output = w3_d8pt)
+plot(rast(w3_d8pt))
+
+
+#delineate streams
+w3_streams_ext <- file.path(".", 
+                      "unprocessed",
+                      "1m hydro enforced dem", 
+                      "hydem10mlpns_streams_ext.tif")
+wbt_extract_streams(flow_accum = w3_flowacc,
+                    output = w3_streams_ext,
+                    threshold = 80)
+plot(rast(w3_streams_ext))
+
+w3_pour_filename <- file.path(".", 
+                      "unprocessed",
+                      "1m hydro enforced dem", 
+                      "w3_pour_snap.shp")
+w3_pour_snap <- file.path(".", 
+                      "unprocessed",
+                      "1m hydro enforced dem", 
+                      "w3_pour_snap2.shp")
+wbt_jenson_snap_pour_points(pour_pts = w3_pour_filename,
+                            streams = w3_streams_ext,
+                            output = w3_pour_snap,
+                            snap_dist = 20)
+w3_pour_snap_read <- vect(w3_pour_snap)
+plot(rast(w3_streams_ext), 
+     xlim = c(281400, 281800),
+     ylim = c(4870400, 4870600))
+points(w3_pour_snap_read, pch = 1)
+
+w3_shed <- file.path(".", 
+                      "unprocessed",
+                      "1m hydro enforced dem", 
+                      "hydem10mlpns_shed.tif")
+wbt_watershed(d8_pntr = w3_d8pt,
+              pour_pts = w3_pour_snap,
+              output = w3_shed)
+plot(rast(w3_shed))
+#crop and mask to W3
+w3_only <- crop10 %>% 
+  mask(rast(w3_shed))
+plot(w3_only)
+#save output as a new DEM
+writeRaster(w3_only, 
+            file.path(".", 
+                      "processed",
+                      "hydem10mlpns_dem.tif"), 
+            overwrite = TRUE)
+
+w3_only_1 <- (w3_only * 0) + 1
+writeRaster(w3_only_1, 
+            file.path(".", 
+                      "processed",
+                      "hydem10mlpns_wsbound.tif"), 
+            overwrite = TRUE)
+
+# channel
+w3_streams <- rast(w3_streams_ext) %>% 
+  mask(rast(w3_shed))
+plot(w3_streams)
+w3_streams_crop <- file.path(".", 
+                      "unprocessed",
+                      "1m hydro enforced dem", 
+                      "hydem10mlpns_streams_crop.tif")
+writeRaster(w3_streams, 
+            w3_streams_crop, 
+            overwrite = TRUE)
+channel_10m <- file.path(".", 
+                      "processed",
+                      "channel_10m.shp")
+wbt_raster_streams_to_vector(
+  streams = w3_streams_crop,
+  d8_pntr = w3_d8pt,
+  output = channel_10m
+)
+
+plot(vect(channel_10m))
+channel2 <- vect(channel_10m, crs = crs(dem))
+
+# NEED TO ADD THE START AND END NODES
+# 2. Break multipart lines into individual components
+# This converts MULTILINESTRING to LINESTRING
+single_parts <- st_cast(as_sf(vect(channel_10m, crs = crs(dem)), "LINESTRING"))
+
+# 3. View the new, broken-down data
+print(single_parts)
+plot(single_parts)
+coords <- st_coordinates(single_parts)
+
+
+library(sfnetworks)
+
+net <- as_sfnetwork(single_parts, directed = TRUE)
+
+# Extract nodes
+nodes <- st_as_sf(net, "nodes")
+
+# Extract edges
+edges <- st_as_sf(net, "edges")
+
+edges$length_m <- st_length(edges)
+test <- edges %>% 
+  select(from, to, geometry, length_m) %>% 
+  mutate("Identifier" = dplyr::row_number()) %>% 
+  vect() %>% 
+  terra::project("EPSG:26919") %>% 
+  crop(dem)
+
+conv_channel <- convert_channel(
+    test,
+    property_names = c(name = "Identifier", 
+                       length = "length_m", startNode = "from",
+                       endNode= "to"),
+    default_width = 2,
+    default_slope = 0.001
+)
+file.path(".","processed","channel_10m.shp")
+writeVector(conv_channel,file.path(".","processed","channel_10m.shp"),overwrite=TRUE)
+
+vect()
+```
+
+
+# OBS PREP
+```{r}
+
+flow <- as.xts(read.zoo(file.path(".", "unprocessed","HBEF_DailyStreamflow_1956-2024.csv"),
+                        header=TRUE,sep=",",drop=FALSE)) 
+head(flow)
+flow_w3 <- flow[flow$WS == 3, ]
+subset_flow <- flow_w3["2003-06-01/2003-07-01"] 
+subset_flow[,2] <- subset_flow[,2] #* 0.003404861
+```
+
+```{r precip and discharge}
+# discharge
+# mm/day
+subset_flow <- 
+  read_csv(file.path(".", 
+                   "unprocessed",
+                   "HBEF_DailyStreamflow_1956-2024.csv")) %>% 
+  filter(DATE >= "2003-06-01",
+         DATE <= "2003-07-01",
+         WS == 3) %>% 
+  mutate(Streamflow = Streamflow) %>% 
+  select(DATE, Streamflow) %>% 
+  as.xts()
+```
+
+```{r}
+
+precip <- as.xts(read.zoo(file.path(".", "unprocessed",
+                                  "dailyWatershedPrecip1956-2025.csv"),
+                        header=TRUE,sep=",",drop=FALSE)) 
+# precipitation in mm/day, need to convert to m/day
+head(precip)
+precip_w3 <- precip[precip$watershed == "W3", ] 
+
+subset_precip <- precip_w3["2003-06-01/2003-07-01"] 
+
+subset_precip$Precip <- subset_precip$Precip
+```
+
+```{r PRECIP}
+# precipitation
+# m/day
+subset_precip <- read_csv(file.path(".", 
+                   "unprocessed",
+                   "dailyWatershedPrecip1956-2025.csv")) %>% 
+  filter(DATE >= "2003-06-01",
+         DATE <= "2003-07-01",
+         watershed == "W3") %>% 
+  mutate(precip = Precip / 1000) %>% 
+  select(DATE, precip) %>% 
+  as.xts()
+```
+
+```{r PET}
+# PET
+# m/day
+met %>% 
+  mutate(pet = 4.5 / 1000) %>% # PET in m
+  select(date, pet) %>% 
+  write_csv("unprocessed/pet.csv")
+
+
+pet <- as.xts(read.zoo(file.path(".", "unprocessed","pet.csv"),
+                        header=TRUE,sep=",",drop=FALSE))
+
+# --- Inputs -------------------------------------------------------------
+library(tidyverse)
+library(lubridate)
+
+
+temps <- read_csv("unprocessed/HBEF_air_temp_daily.csv") %>% 
+  filter(date >= "2003-06-01",
+         date <= "2003-07-01",
+         STA == "STA6") %>% 
+  select(date, MAX, MIN)
+write_csv(temps, "unprocessed/air_temp_sta6.csv")
+
+# example data frame
+met <- data.frame(
+  date = temps$date,
+  tmin = temps$MIN,   # °C
+  tmax = temps$MAX   # °C
+)
+
+lat <- 45   # latitude in decimal degrees (e.g., Blacksburg VA)
+
+# --- Hargreaves PET -----------------------------------------------------
+
+hargreaves_pet <- function(date, tmin, tmax, lat){
+
+  J <- yday(date)                 # day of year
+  phi <- lat * pi/180             # latitude radians
+  
+  # extraterrestrial radiation (Ra)
+  dr  <- 1 + 0.033*cos(2*pi*J/365)
+  delta <- 0.409*sin(2*pi*J/365 - 1.39)
+  ws <- acos(-tan(phi)*tan(delta))
+
+  Gsc <- 0.0820   # MJ m-2 min-1
+  
+  Ra <- (24*60/pi) * Gsc * dr *
+        (ws*sin(phi)*sin(delta) +
+         cos(phi)*cos(delta)*sin(ws))
+
+  tmean <- (tmin + tmax)/2
+
+  PET <- 0.0023 * Ra *
+         (tmean + 17.8) *
+         sqrt(pmax(tmax - tmin, 0))
+
+  return(PET)   # mm/day
+}
+
+# --- Calculate PET ------------------------------------------------------
+
+met$PET_mm_day <- hargreaves_pet(
+  met$date,
+  met$tmin,
+  met$tmax,
+  lat
+)
+
+met$PET_01 <- (met$PET_mm - min(met$PET_mm, na.rm=TRUE)) /
+              (max(met$PET_mm, na.rm=TRUE) -
+               min(met$PET_mm, na.rm=TRUE))
+ 
+```
+
+```{r combine-datasets}
+obs <- merge(subset_flow,
+             subset_precip,
+             pet,
+             all=FALSE) ## merge by time stamp
+#obs <- obs[ , colSums(is.na(obs)) == 0]               # Remove columns with at least one NA
+
+saveRDS(obs,file.path(".", "processed","obs.rds"))
+```
+
+# CREATE DYNATOP OBJECT
+```{r}
+ctch <- dynatopGIS$new(file.path(".", "dynaGIS"))
+# add catchment, DEM, channel
+ctch$add_catchment( file.path(".","processed","w3.tif") )
+ctch$add_dem(file.path(".","processed","dem.tif"))
+ctch$add_channel(file.path(".","processed","channel.shp"))
+
+ctch$get_layer()
+
+
+ctch$plot_layer("dem", add_channel=TRUE)
+```
+
+```{r fill-sinks}
+ctch$sink_fill()
+
+terra::plot( ctch$get_layer('filled_dem') - ctch$get_layer('dem'),
+             main="Changes to height")
+```
+
+```{r compute-stuff}
+# bands
+ctch$compute_band()
+ctch$plot_layer("band")
+# twi
+ctch$compute_properties()
+ctch$plot_layer('atb')
+# flow lengths
+ctch$compute_flow_lengths(flow_routing="shortest")
+ctch$plot_layer("shortest_flow_length")
+```
+
+```{r classifying and cutting}
+## simple equally spaced cuts
+ctch$classify("atb_20","atb",20)
+ctch$plot_layer("atb_20")
+
+## use the quantile function of the raster package to compute breaks
+## note we need to include the min and max
+brk <- global(ctch$get_layer("atb"), fun=quantile,probs = seq(0, 1, length = 21),na.rm=T)
+ctch$classify("atb_20_equal","atb",brk)
+ctch$plot_layer("atb_20_equal")
+
+ctch$combine_classes("atb_20_subcatch",c("atb_20","catchment"))
+ctch$plot_layer("atb_20_subcatch")
+
+ctch$combine_classes("atb_20_subcatch_band",c("atb_20_subcatch","band"))
+ctch$plot_layer("atb_20_subcatch_band")
+
+
+# Look at classes
+tmp <- ctch$get_method("atb_5")
+tmp$type
+#> [1] "combination"
+head(tmp$groups)
+
+```
+
+```{r create the model}
+ctch$create_model(file.path("./dynaGIS","atb_20"), # name of new model
+                  "atb_20", # classification to base model on
+                  sf_opt="kin",
+                  sz_opt="exp",
+                  )
+
+## load the model
+mdl <- readRDS( file.path(".","dynaGIS","atb_20_equal.rds")) ## read the model in
+names(mdl)
+```
+
+
+# RUN MODEL
+```{r run model and plot output}
+# Load previously created data
+output_defn <- data.frame(name = "W3",
+                      id = 1,
+                      flux = "q_sf",
+                      scale = 1)
+mdl <- readRDS(file.path(".","dynaGIS","atb_20.rds"))
+obs <- readRDS(file.path(".","processed","obs.rds"))
+# initialize dynatop object
+hru <- mdl$hru
+ctch_mdl <- dynatop$new(hru)
+
+ctch_mdl$add_data(obs)
+## determining the initial recharge rate ad setting it in the model
+# I think the same number is the watershed area...
+r0 <- as.numeric(obs$Streamflow[1])
+r0 <- as.numeric(obs$Streamflow[1]) / sum( sapply( hru, function(x){x$properties["area"]} ) )
+hru <- lapply(hru,function(h){h$initialisation["r_uz_sz_0"] <- r0;h})
+
+## the map input is only needed for visualisation
+ctch_mdl <- dynatop$new( hru, map = mdl$map
+  )$add_data( obs
+  )$initialise(
+  )$sim( output_defn
+  )
+
+plot( merge(obs$Streamflow,sim_gauge),main="Simulated and observed flows",
+     legend.loc='topright')
+
+```
+
+```{r Mass Balance}
+mb <- ctch_mdl$get_mass_errors()
+head(mb)
+plot( mb$err , main="Mass balance error",ylab="m^3")
+
+# Gauge Flows
+sim_gauge <- ctch_mdl$get_output() ## extract the flow as an xts object
+head(sim_gauge)
+
+ctch_mdl$plot_output()
+
+plot( merge(obs$Streamflow,sim_gauge),main="Simulated and observed flows",
+     legend.loc='topleft')
+```
+
+```{r}
+## extract the current states as a data.frame
+current_state <- ctch_mdl$get_states()
+## columns correspond to the Hill-slope HRU ID, and the storage's in each of the four zones
+head(current_state)
+
+
+ctch_mdl$plot_state("s_sf")
+ctch_mdl$plot_state("s_rz")
+ctch_mdl$plot_state("s_uz")
+ctch_mdl$plot_state("s_sz")
+```
+
+```{r changing parameters}
+fpar <- function(h){ ## h is the hru
+    ## test if a channel
+    if( !is.na(h$class$startNode) ){
+        ## change type
+        h$sf$type <- "kin"
+        h$sf$param["c_sf"] <- 1
+    }
+    h
+}
+
+chn_id <- do.call(c, lapply( hru, function(h){ if(!is.na(h$class$startNode)){ h$id } }))
+
+out_hyd <-  data.frame( name = paste0("hyd_",chn_id),
+                       id = chn_id,
+                       flux = "v_sf_rz", scale =-1/900) # scale is negative since flux usually downwards, 1/900 is 1/timestep
+
+## function to compute the relevent part so the output definition for each potential source HRU
+fout <- function(h){
+    ## test if it is a channel HRU - in which case return NULL
+    if( !is.na(h$class$startNode) ){ return(NULL) }
+        
+    ## index of flow directiuons going to other channels
+    idx <- h$sf_flow_direction$id %in% chn_id
+    if(!any(idx)){ return(NULL) } ## quit if no links!
+    ## create partial output defn
+    data.frame(
+        name = paste0("hyd_",h$sf_flow_direction$id[idx]), ## which inflow does it alter
+        id = h$id, ## flux comes from this HRU
+        flux = "q_sf", # surface flux out of this HRU is input to the next
+        scale = h$sf_flow_direction$fraction[idx] # scale is fraction of flow (since taking it away)
+    )
+}
+## row bind to give a data.frame
+tmp <- do.call( rbind, lapply( hru, fout) )
+
+## row bind onto the intial data frame
+out_hyd <- rbind( out_hyd, tmp )
+
+## sort this, not needed but easier to look at
+out_hyd <- out_hyd[ order(out_hyd$name), ]
+
+ctch_mdl <- dynatop$new(hru)$add_data(obs)$initialise()$sim(out_hyd)
+plot( ctch_mdl$get_output()[,1:10])
+```
+
