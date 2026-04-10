@@ -1,0 +1,527 @@
+---
+title: "HB_dynatop2"
+format: html
+editor_options: 
+  chunk_output_type: console
+---
+Attempt 2, using 15 minute timestep inputs over a shorter period of time.
+# SETUP
+```{r}
+library(pacman)
+
+p_load(terra, dynatop, dynatopGIS, xts, whitebox, tidyverse,
+       lubridate,
+       sf, # working with st and sf objects
+       tidyterra, # do tidy ops on terra objects
+       sfnetworks # create start and end nodes for channel network
+       )
+setwd("./hb_data")
+```
+
+# GIS PREP
+```{r GIS files}
+dem_path <- file.path(".", "unprocessed",
+                      "1m hydro enforced dem","hydem1mlpns.tif")
+dem <- rast(dem_path) # load the dem as a raster layer
+plot(dem)
+
+# crop DEM to a rough rectangle
+ybounds <- c(4870350,4871350)
+xbounds <- c(281350, 282150)
+crop1 <- crop(dem, ext(c(xbounds, ybounds)))
+plot(crop1)
+crop_dem_path <- file.path(".", "unprocessed",
+                      "1m hydro enforced dem","hydem1mlpns_cropped.tif")
+writeRaster(crop1, crop_dem_path, overwrite = TRUE)
+####delineate watershed and keep watershed boundary
+
+w3_breached <- "./unprocessed/whitebox_outputs/1mdem_breach.tif"
+wbt_breach_depressions_least_cost(
+  dem = crop_dem_path,
+  output = w3_breached,
+  dist = 1,
+  fill = TRUE)
+
+w3_filled <- "./unprocessed/whitebox_outputs/1mdem_fill.tif"
+wbt_fill_depressions_wang_and_liu(
+  dem = w3_breached,
+  output = w3_filled
+)
+#calculate flow accumulation and direction
+w3_flowacc <- "./unprocessed/whitebox_outputs/1mdem_w3_flowacc.tif"
+wbt_d8_flow_accumulation(input = w3_filled,
+                         output = w3_flowacc)
+w3_d8pt <- "./unprocessed/whitebox_outputs/1mdem_w3_d8pt.tif"
+wbt_d8_pointer(dem = w3_filled,
+               output = w3_d8pt)
+
+#delineate streams
+w3_streams <- "./unprocessed/whitebox_outputs/w3_streams.tif"
+wbt_extract_streams(flow_accum = w3_flowacc,
+                    output = w3_streams,
+                    threshold = 8000)
+plot(rast(w3_streams))
+
+# convert streams to shapefile
+w3_streams_vect <- "./unprocessed/whitebox_outputs/w3_streams_vect.shp"
+wbt_raster_streams_to_vector(streams = w3_streams,
+                             d8_pntr = w3_d8pt,
+                             output = w3_streams_vect)
+
+# get pour point ready
+pour_point_path <- file.path(".", 
+                             "unprocessed",
+                             "1m hydro enforced dem", "w3_pour_snap.shp")
+plot(vect(pour_point_path), add = TRUE)
+
+w3_pour_snap <- "./unprocessed/whitebox_outputs/w3_pour_snap.shp"
+wbt_jenson_snap_pour_points(pour_pts = pour_point_path,
+                            streams = w3_streams,
+                            output = w3_pour_snap,
+                            snap_dist = 10)
+w3_pour_snap_read <- vect(w3_pour_snap)
+plot(rast(w3_streams), 
+     xlim = c(281400, 282000),
+     ylim = c(4870400, 4870800))
+points(w3_pour_snap_read, pch = 1)
+
+
+w3_shed <- "./unprocessed/whitebox_outputs/w3_shed.tif"
+wbt_watershed(d8_pntr = w3_d8pt,
+              pour_pts = w3_pour_snap,
+              output = w3_shed)
+
+plot(rast(w3_shed))
+#convert raster of watershed area to vector for final mapping
+w3_outline <- as.polygons(rast(w3_shed), extent=FALSE)
+plot(w3_outline)
+
+plot(w3_outline)
+
+channel <- vect(w3_streams_vect) %>% 
+  crop(w3_outline)
+
+
+# crop and mask DEM by watershed outline
+dem_crop_mask <- rast(w3_filled) %>% 
+  crop(w3_outline) %>% 
+  mask(w3_outline)
+
+#create watershed area, just use area of DEM
+outline <- (dem_crop_mask * 0) + 1
+# extend both rasters by 1 pixel
+outline_extended <- extend(outline,1)
+dem_final <- extend(dem_crop_mask,1)
+
+
+writeRaster(outline_extended,file.path(".","processed","w3.tif"),overwrite=TRUE)
+writeRaster(dem_final,file.path(".","processed","dem.tif"),overwrite=TRUE)
+```
+```{r convert channel}
+plot(channel)
+channel <- channel %>% 
+  mutate(ID = seq(1, n(), 1))
+# 2. Break multipart lines into individual components
+# This converts MULTILINESTRING to LINESTRING
+single_parts <- st_cast(as_sf(channel), "LINESTRING")
+
+# 3. View the new, broken-down data
+print(single_parts)
+plot(single_parts)
+coords <- st_coordinates(single_parts)
+
+
+net <- as_sfnetwork(single_parts, directed = TRUE)
+
+# Extract nodes
+nodes <- st_as_sf(net, "nodes")
+
+# Extract edges
+edges <- st_as_sf(net, "edges")
+
+edges$length_m <- st_length(edges)
+test <- 
+  edges %>% 
+  select(from, to, geometry, length_m) %>% 
+  mutate("Identifier" = dplyr::row_number()) %>% 
+  vect() #%>%
+
+crs(test) <- crs(dem_final)
+
+conv_channel <- convert_channel(
+    test,
+    property_names = c(name = "Identifier", 
+                       length = "length_m", startNode = "from",
+                       endNode= "to"),
+    default_width = 1,
+    default_slope = 0.001
+)
+
+writeVector(conv_channel,file.path(".","processed","channel.shp"),overwrite=TRUE)
+
+# name is different than the start and end nodes!
+conv_channel %>% 
+  as.data.frame() %>% 
+  tibble()
+```
+
+```{r}
+# Find the outlet ID right after you create your 'edges' object
+edges_df <- st_drop_geometry(edges)
+outlet_edge <- edges_df %>% filter(!(to %in% from))
+outlet_id <- outlet_edge$ID
+
+# Update your output definition using the correct outlet ID
+output_defn <- data.frame(name = "W3",
+                          id = outlet_id,
+                          flux = "q_sf",
+                          scale = 1)
+
+
+## create a vector of the uid's of the HRUs
+hid <- sapply(mdl$hru,function(h){h$id})
+## create a vector of the channel names with as storaged in the class variabel
+cname <- sapply(mdl$hru,function(h){h$class$name})
+idx <- match(gauges$chn_identi, cname) ## index of HRU's corresponding to gauges
+## create as a data.frame
+gauge_output <- data.frame(name = gauges$Site.Name,
+                           id = as.integer(hid[idx]),
+                           flux = "q_sf",
+                           scale = 1)
+saveRDS(gauge_output,file.path(".","dyna","gauge_output_defn.rds")) ## save the output for later use
+gauge_output
+```
+
+
+# TIMESERIES
+```{r}
+start <- "2018-05-21"
+end <- "2018-10-21"
+
+summary(flow_15min)
+summary(precip)
+summary(air)
+
+#2017 - 2024
+```
+
+```{r discharge}
+# discharge every 15 mins
+flow_15min <- read_csv("https://pasta.lternet.edu/package/data/eml/knb-lter-hbr/1/18/1b101627265d0b5763fa0bba93d93bf7") 
+
+flow_xts <- 
+  flow_15min %>%
+  filter(DATETIME >= start,
+         DATETIME <= end) %>% 
+  # Create a new column that groups time into 15-minute buckets
+  mutate(time_15 = floor_date(DATETIME, "15 mins")) %>%
+  # Group by those buckets
+  group_by(time_15) %>%
+  # Average the 5-minute instantaneous rates to get the 15-minute rate
+  summarize(Discharge_ls = mean(Discharge_ls, na.rm = TRUE)) %>%
+  # convert to m3_s, or should it be m3/day?>
+  mutate(Discharge_m3_s = Discharge_ls / 1000) %>% 
+  as.xts()
+
+```
+Units of precipitation and pet are expected to be m accrued over the previous timestep.
+```{r precipitation}
+precip <- read_csv("https://pasta.lternet.edu/package/data/eml/knb-lter-hbr/278/7/132ffe0622ff3f30505c774d24a6b65d")
+# precip in mm accrued over timestep, needs to be m accrued over time step
+
+precip_xts <- 
+  precip %>% 
+  filter(DateTime >= start,
+         DateTime <= end) %>% 
+  select(DateTime, precip) %>% 
+  mutate(precip = precip / 1000) %>% # convert to m
+  as.xts()
+```
+
+```{r pet}
+# air temp already 15 min increment
+air <- read_csv("https://pasta.lternet.edu/package/data/eml/knb-lter-hbr/322/7/a96172a26f381b9ec7005144d12e0820")
+
+air_formatted <- air %>% 
+  filter(DateTime >= start,
+         DateTime <= end) %>% 
+  select(DateTime, airTemp) 
+
+# convert airTemp to pet with hargreaves
+
+lat <- 45   # latitude in decimal degrees (e.g., Blacksburg VA)
+
+# --- Hargreaves PET -----------------------------------------------------
+
+hargreaves_pet <- function(date, temp, lat){
+
+  J <- yday(date)                 # day of year
+  phi <- lat * pi/180             # latitude radians
+  
+  # extraterrestrial radiation (Ra)
+  dr  <- 1 + 0.033*cos(2*pi*J/365)
+  delta <- 0.409*sin(2*pi*J/365 - 1.39)
+  ws <- acos(-tan(phi)*tan(delta))
+
+  Gsc <- 0.0820   # MJ m-2 min-1
+  
+  Ra <- (24*60/pi) * Gsc * dr *
+        (ws*sin(phi)*sin(delta) +
+         cos(phi)*cos(delta)*sin(ws))
+
+  PET <- 0.0023 * Ra *
+         (temp + 17.8) *
+         sqrt(pmax(temp, 0))
+
+  return(PET)   # mm/day
+}
+
+# --- Calculate PET ------------------------------------------------------
+
+air_formatted$PET_mm_day <- hargreaves_pet(
+  air_formatted$DateTime,
+  air_formatted$airTemp,
+  lat
+)
+
+
+pet_xts <- air_formatted %>% 
+  select(DateTime, PET_mm_day) %>% 
+  mutate(PET_m_day = PET_mm_day / (1000 * 96)) %>% # convert to m, and 15 min
+  rename(pet = PET_m_day) %>% 
+  select(DateTime, pet) %>% 
+  as.xts()
+
+pet_xts <- air_formatted %>% 
+  select(DateTime, PET_mm_day) %>% 
+  mutate(PET_m_day = PET_mm_day/1000/1000/96) %>% # convert to m, and 15 min
+  rename(pet = PET_m_day) %>% 
+  select(DateTime, pet) %>% 
+  as.xts()
+
+ 
+```
+
+```{r combine}
+
+obs <- merge(flow_xts,
+             precip_xts,
+             pet_xts,
+             all=FALSE) ## merge by time stamp
+#obs <- obs[ , colSums(is.na(obs)) == 0]               # Remove columns with at least one NA
+
+# Save it
+# saveRDS(obs, file.path(".", "processed", "obs_notright.rds"))
+# obs_nr <- readRDS(file.path(".", "processed", "obs_notright.rds"))
+
+#saveRDS(obs, file.path(".", "processed", "obs.rds"))
+```
+
+List of problems:
+- the s_sf state, storage in the surface, should be less than 1 everywhere that is not flowing, or stream network reaches.
+
+# RUN MODEL
+Fixed running model I think!
+```{r}
+rm(list=ls())
+
+## Load model and data
+mdl <- readRDS(file.path(".", "dynaGIS", "atb_20.rds"))
+mdl2 <- readRDS(file.path(".", "dynaGIS", "VERYGOODMODEL.rds"))
+#obs <- readRDS(file.path(".", "processed", "obs.rds"))
+hru <- readRDS(file.path(".", "dynaGIS", "VERYGOODMODEL_hru.rds"))
+## ── FIX 1 & 2: Convert precip and PET from mm/step to m/step ──────────────
+#obs$precip <- obs$precip / 1000
+#obs$pet    <- obs$pet    / 1000
+
+fpar <- function(h){ ## h is the hru
+    ## test if a channel
+    if( !is.na(h$class$startNode) ){
+        ## change type
+        h$sf$type <- "kin"
+        h$sf$param["c_sf"] <- 1
+    }
+    h
+}
+
+fpar <- function(h){ ## h is the hru
+    
+        h$uz$parameters["t_d"] <- 104.775
+        h$sz$parameters["m"] <- 0.00698783
+    h
+}
+hru <- lapply(hru, fpar)
+
+chn_id <- do.call(c, lapply( hru, function(h){ if(!is.na(h$class$startNode)){ h$id } }))
+
+out_hyd <-  data.frame( name = paste0("hyd_",chn_id),
+                       id = chn_id,
+                       flux = "v_sf_rz", scale =-1/900) # scale is negative since flux usually downwards, 1/900 is 1/timestep
+
+output_defn <- out_hyd[2,]
+
+
+ctch_mdl <- dynatop$new(hru, map = mdl$map)$add_data(obs)$initialise()$sim(output_defn)
+
+
+plot(ctch_mdl$get_output(), legend.loc='topright')
+
+plot(merge(ctch_mdl$get_output(), obs$Discharge_m3_s),  main="Modeled discharge",ylab="m^3",
+        legend.loc='topright')
+
+1 - sum((obs$Discharge_m3_s-ctch_mdl$get_output())^2,na.rm=TRUE) /sum((obs$Discharge_m3_s - mean(obs$Discharge_m3_s,na.rm=TRUE))^2,na.rm=TRUE)
+```
+
+
+# CLEAN RUN, ITERATE ON AVAILABLE YEARS
+```{r}
+
+years <- seq(17, 24, 1)
+
+for(i in 1:length(years)){
+start <- paste0("20",years[i],"-05-01")
+end <- paste0("20",years[i],"-10-31")
+###### Create obs ######
+flow_xts <- 
+  flow_15min %>%
+  filter(DATETIME >= start,
+         DATETIME <= end) %>% 
+  # Create a new column that groups time into 15-minute buckets
+  mutate(time_15 = floor_date(DATETIME, "15 mins")) %>%
+  # Group by those buckets
+  group_by(time_15) %>%
+  # Average the 5-minute instantaneous rates to get the 15-minute rate
+  summarize(Discharge_ls = mean(Discharge_ls, na.rm = TRUE)) %>%
+  # convert to m3_s, or should it be m3/day?>
+  mutate(Discharge_m3_s = Discharge_ls / 1000) %>% 
+  as.xts()
+
+
+precip_xts <- 
+  precip %>% 
+  filter(DateTime >= start,
+         DateTime <= end) %>% 
+  select(DateTime, precip) %>% 
+  mutate(precip = precip / 1000) %>% # convert to m
+  as.xts()
+
+
+air_formatted <- air %>% 
+  filter(DateTime >= start,
+         DateTime <= end) %>% 
+  select(DateTime, airTemp)
+
+air_formatted$PET_mm_day <- hargreaves_pet(
+  air_formatted$DateTime,
+  air_formatted$airTemp,
+  lat
+)
+
+pet_xts <- air_formatted %>% 
+  select(DateTime, PET_mm_day) %>% 
+  mutate(PET_m_day = PET_mm_day/1000/1000/96) %>% # convert to m, and 15 min
+  rename(pet = PET_m_day) %>% 
+  select(DateTime, pet) %>% 
+  as.xts()
+
+
+obs <- merge(flow_xts,
+             precip_xts,
+             pet_xts,
+             all=FALSE)
+
+###### Run Model ######
+ctch_mdl <- dynatop$new(hru, map = mdl$map)$add_data(obs)$initialise()$sim(output_defn)
+
+
+datetime <- index(obs)
+actual <- obs$Discharge_m3_s
+modeled <- ctch_mdl$get_output()
+
+# return nse
+nse <- 1 - sum((obs$Discharge_m3_s-ctch_mdl$get_output())^2,na.rm=TRUE) /sum((obs$Discharge_m3_s - mean(obs$Discharge_m3_s,na.rm=TRUE))^2,na.rm=TRUE)
+
+output <- data.frame(
+  "datetime" = datetime,
+  "actual" = actual,
+  "modeled" = modeled,
+  "nse" = nse
+) %>% tibble()
+
+if (i == 1) alldat <- output
+if (i > 1) alldat <- rbind(alldat, output)
+}
+colnames(alldat) <- c("datetime",
+                      "Discharge",
+                      "Model",
+                      "NSE")
+alldat %>% 
+  mutate(year = year(datetime)) %>% 
+  pivot_longer(-c(datetime, NSE, year)) %>% 
+  ggplot(aes(x = datetime, y = value, color = name))+
+  geom_line()+
+  theme_classic()+
+  facet_wrap(~year, scales = "free")+
+  scale_color_manual(values = c("black",
+                                "salmon"))
+
+alldat %>% 
+  mutate(year = year(datetime)) %>% 
+  select(year, NSE) %>% 
+  unique()
+```
+
+
+
+
+
+```{r identifying channels}
+
+chn_id <- do.call(c, lapply( hru, function(h){ if(!is.na(h$class$startNode)){ h$id } }))
+
+out_hyd <-  data.frame( name = paste0("hyd_",chn_id),
+                       id = chn_id,
+                       flux = "v_sf_rz", scale =-1/900) # scale is negative since flux usually downwards, 1/900 is 1/timestep
+
+output_defn <- out_hyd[2,]
+## function to compute the relevent part so the output definition for each potential source HRU
+fout <- function(h){
+    ## test if it is a channel HRU - in which case return NULL
+    if( !is.na(h$class$startNode) ){ return(NULL) }
+        
+    ## index of flow directiuons going to other channels
+    idx <- h$sf_flow_direction$id %in% chn_id
+    if(!any(idx)){ return(NULL) } ## quit if no links!
+    ## create partial output defn
+    data.frame(
+        name = paste0("hyd_",h$sf_flow_direction$id[idx]), ## which inflow does it alter
+        id = h$id, ## flux comes from this HRU
+        flux = "q_sf", # surface flux out of this HRU is input to the next
+        scale = h$sf_flow_direction$fraction[idx] # scale is fraction of flow (since taking it away)
+    )
+}
+## row bind to give a data.frame
+tmp <- do.call( rbind, lapply( hru, fout) )
+
+## row bind onto the intial data frame
+out_hyd <- rbind( out_hyd, tmp )
+
+## sort this, not needed but easier to look at
+out_hyd <- out_hyd[ order(out_hyd$name), ]
+
+ctch_mdl <- dynatop$new(hru)$add_data(obs)$initialise()$sim(out_hyd)
+plot( ctch_mdl$get_output(), legend.loc='topright')
+```
+
+```{r}
+## extract the current states as a data.frame
+current_state <- ctch_mdl$get_states()
+## rows correspond to the Hill-slope HRU ID, and the storage's in each of the four zones
+head(current_state)
+
+ctch_mdl$plot_state("s_sf")
+ctch_mdl$plot_state("s_rz")
+ctch_mdl$plot_state("s_uz")
+ctch_mdl$plot_state("s_sz")
+```
+

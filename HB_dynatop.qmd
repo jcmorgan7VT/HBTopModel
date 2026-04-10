@@ -677,6 +677,7 @@ ctch_mdl <- dynatop$new(hru)$
 
 1 - sum((obs$Discharge_m3_s-ctch_mdl$get_output())^2,na.rm=TRUE) /sum((obs$Discharge_m3_s - mean(obs$Discharge_m3_s,na.rm=TRUE))^2,na.rm=TRUE)
 
+#saveRDS(hru,file.path(".","dynaGIS","VERYGOODMODEL_hru.rds"))
 ```
 
 ```{r}
