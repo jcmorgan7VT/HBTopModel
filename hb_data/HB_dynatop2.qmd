@@ -9,12 +9,14 @@ Attempt 2, using 15 minute timestep inputs over a shorter period of time.
 ```{r}
 library(pacman)
 
-p_load(terra, dynatop, dynatopGIS, xts, whitebox, tidyverse,
+p_load(terra, xts, whitebox, tidyverse,
        lubridate,
        sf, # working with st and sf objects
        tidyterra, # do tidy ops on terra objects
        sfnetworks # create start and end nodes for channel network
        )
+devtools::load_all(file.path("/Users/johnmorgan/Documents/HBTopModel/dynatop")) ## attach the revised package
+
 setwd("./hb_data")
 ```
 
@@ -286,14 +288,14 @@ air_formatted$PET_mm_day <- hargreaves_pet(
 
 
 pet_xts <- air_formatted %>% 
-  select(DateTime, PET_mm_day) %>% 
+  select(DateTime, PET_mm_day, airTemp) %>% 
   mutate(PET_m_day = PET_mm_day / (1000 * 96)) %>% # convert to m, and 15 min
   rename(pet = PET_m_day) %>% 
   select(DateTime, pet) %>% 
   as.xts()
 
 pet_xts <- air_formatted %>% 
-  select(DateTime, PET_mm_day) %>% 
+  select(DateTime, PET_mm_day, airTemp) %>% 
   mutate(PET_m_day = PET_mm_day/1000/1000/96) %>% # convert to m, and 15 min
   rename(pet = PET_m_day) %>% 
   select(DateTime, pet) %>% 
@@ -372,6 +374,162 @@ plot(merge(ctch_mdl$get_output(), obs$Discharge_m3_s),  main="Modeled discharge"
 1 - sum((obs$Discharge_m3_s-ctch_mdl$get_output())^2,na.rm=TRUE) /sum((obs$Discharge_m3_s - mean(obs$Discharge_m3_s,na.rm=TRUE))^2,na.rm=TRUE)
 ```
 
+
+```{r}
+
+start <- "2017-05-01"
+end <- "2024-10-01"
+###### Create obs ######
+flow_xts <- 
+  flow_15min %>%
+  filter(DATETIME >= start,
+         DATETIME <= end) %>% 
+  # Create a new column that groups time into 15-minute buckets
+  mutate(time_15 = floor_date(DATETIME, "15 mins")) %>%
+  # Group by those buckets
+  group_by(time_15) %>%
+  # Average the 5-minute instantaneous rates to get the 15-minute rate
+  summarize(Discharge_ls = mean(Discharge_ls, na.rm = TRUE)) %>%
+  # convert to m3_s, or should it be m3/day?>
+  mutate(Discharge_m3_s = Discharge_ls / 1000) %>% 
+  as.xts()
+
+
+precip_xts <- 
+  precip %>% 
+  filter(DateTime >= start,
+         DateTime <= end) %>% 
+  select(DateTime, precip) %>% 
+  mutate(precip = precip / 1000) %>% # convert to m
+  as.xts()
+
+
+air_formatted <- air %>% 
+  filter(DateTime >= start,
+         DateTime <= end) %>% 
+  select(DateTime, airTemp)
+
+air_formatted$PET_mm_day <- hargreaves_pet(
+  air_formatted$DateTime,
+  air_formatted$airTemp,
+  lat
+)
+
+pet_xts <- air_formatted %>% 
+  select(DateTime, PET_mm_day, airTemp) %>% 
+  mutate(PET_m_day = PET_mm_day/1000/1000/96) %>% # convert to m, and 15 min
+  rename(pet = PET_m_day, 
+         temp = airTemp) %>% 
+  select(DateTime, pet, temp) %>% 
+  as.xts()
+
+
+obs <- merge(flow_xts,
+             precip_xts,
+             pet_xts,
+             all=FALSE)
+
+
+mdl$hru <- hru
+w3_working <- list("model" = mdl, "obs" = obs)
+save(w3_working, file = "./data/w3_test.rda")
+```
+
+# Test with snow module
+```{r}
+Swindale <- w3_working
+names(Swindale$obs) <- c("Discharge_ls",   "Discharge_m3_s", "precip","pet","temp_series" )
+names(obs) <- c("Discharge_ls",   "Discharge_m3_s", "precip","pet","temp_series" )
+
+###### bigger data replacement ######
+# 1. Load the existing built-in dataset
+ # or data/Swindale.rda, whichever exists in the data/ folder
+
+# 2. Patch the HRUs with snow parameters, temp linkages, and expanded states
+for (i in seq_along(Swindale$model$hru)) {
+  
+  # A. Add the snow parameters
+  Swindale$model$hru[[i]]$snow <- list(
+    type = "hbv",
+    parameters = c(T_T = 0.0, C_f = 2.5, C_wh = 0.1)
+  )
+  
+  # B. Add the temp linkage 
+  # Note: The original precip linkage uses 'name' and 'fraction'
+  # We will map it to a dummy "temp_series"
+  Swindale$model$hru[[i]]$temp <- list(
+    name = "temp_series",
+    fraction = 1.0
+  )
+  
+  # C. Expand the states to include s_snow and s_liquid
+  Swindale$model$hru[[i]]$states <- c(
+    Swindale$model$hru[[i]]$states, 
+    s_snow = 0, 
+    s_liquid = 0
+  )
+}
+
+# 3. Add a dummy temperature time series to the observations
+# Swindale$obs is likely an xts object or data frame.
+# We'll just add a constant 5.0 degrees C for the tests to run successfully
+
+chn_id <- do.call(c, lapply( Swindale$model$hru, function(h){ if(!is.na(h$class$startNode)){ h$id } }))
+
+out_hyd <-  data.frame( name = paste0("hyd_",chn_id),
+                       id = chn_id,
+                       flux = "v_sf_rz", scale =-1/900) # scale is negative since flux usually downwards, 1/900 is 1/timestep
+
+output_defn <- out_hyd[2,]
+####### TESTING ERROR
+nm <- lapply(Swindale$model$hru,
+                         function(h){unique(c(h$precip$name,h$pet$name,h$temp$name))})
+            nm <- unique(do.call(c,nm))
+
+            ## check names
+            idx <- nm %in% names(Swindale$model$obs)
+            if( !all(idx) ){
+                stop(paste(c("Missing series:",nm[!idx]),collaspe=" "))
+            }
+########
+
+ctch_mdl <- dynatop$new(Swindale$model$hru)$add_data(obs[,-1])$initialise()$sim(output_defn)
+
+
+datetime <- index(obs)
+actual <- obs$Discharge_m3_s
+modeled <- ctch_mdl$get_output()
+
+# return nse
+nse <- 1 - sum((actual-ctch_mdl$get_output())^2,na.rm=TRUE) /sum((actual - mean(actual,na.rm=TRUE))^2,na.rm=TRUE)
+
+output <- data.frame(
+  "datetime" = datetime,
+  "actual" = actual,
+  "modeled" = modeled
+) %>% tibble()
+
+
+
+colnames(output) <- c("datetime",
+                      "Discharge",
+                      "Model")
+output %>% 
+  #mutate(year = year(datetime)) %>% 
+  pivot_longer(-c(datetime)) %>% 
+  #filter(year %in% c("2017")) %>% 
+  ggplot(aes(x = datetime, y = value, color = name))+
+  geom_line()+
+  theme_classic()+
+  #facet_wrap(~year, scales = "free")+
+  scale_color_manual(values = c("black",
+                                "salmon"))
+
+alldat %>% 
+  mutate(year = year(datetime)) %>% 
+  select(year, NSE) %>% 
+  unique()
+```
 
 # CLEAN RUN, ITERATE ON AVAILABLE YEARS
 ```{r}
@@ -458,6 +616,7 @@ colnames(alldat) <- c("datetime",
 alldat %>% 
   mutate(year = year(datetime)) %>% 
   pivot_longer(-c(datetime, NSE, year)) %>% 
+  filter(year %in% c("2017")) %>% 
   ggplot(aes(x = datetime, y = value, color = name))+
   geom_line()+
   theme_classic()+
@@ -471,6 +630,24 @@ alldat %>%
   unique()
 ```
 
+```{r parameter set}
+# print out parameters
+hru[[10]]$sf$parameters   # t_0 >> 1 for typical soils (m²/s)
+hru[[10]]$sz$parameters   # m in range 0.001–0.05
+hru[[10]]$uz$parameters   # t_d in seconds, ~1000–100000
+hru[[10]]$rz$parameters   # s_rzmax in meters ~0.05–0.5
+
+# for channel
+hru[[1]]$sf$parameters   # t_0 >> 1 for typical soils (m²/s)
+hru[[1]]$sz$parameters   # m in range 0.001–0.05
+hru[[1]]$uz$parameters   # t_d in seconds, ~1000–100000
+hru[[1]]$rz$parameters 
+
+library(knitr)
+
+# Basic table in Markdown
+kable(head(mtcars), format = "markdown")
+```
 
 
 
@@ -523,5 +700,305 @@ ctch_mdl$plot_state("s_sf")
 ctch_mdl$plot_state("s_rz")
 ctch_mdl$plot_state("s_uz")
 ctch_mdl$plot_state("s_sz")
+```
+
+```{r}
+keep_times <- index(obs)[seq(1,nrow(obs),by=2)] ## an vector of time steps
+ctch_mdl$initialise()$sim(output_defn,keep_states=keep_times) ## passing the vector of time steps to the call
+state_rec <- ctch_mdl$get_states(record=TRUE) ## returns the whole record of states
+head(names(state_rec)) 
+head(sapply(state_rec,length))
+
+## Create a time series plot of the saturated zone deficit
+# filter to kept records
+s_sz_rec <- state_rec[ sapply(state_rec,length)>0 ]
+# keep just the s_sz and date for each channel HRU
+chn_id
+lapply(s_sz_rec,function(x){x$id}) %>% View()
+
+s_sz_rec <- lapply(s_sz_rec, function(x){ setNames( sapply(x,function(z){z$states["s_sz"]}), sapply(x,function(z){z$id}) )} )
+s_sz_rec <- do.call(rbind,s_sz_rec) ## bind to make matrix
+
+s_sz_df <- data.frame(
+  datetime = timestamps,
+  s_sz_rec,
+  check.names = FALSE
+)
+
+head(s_sz_df[, 1:5])  # datetime + first 4 HRUs
+s_sz_df$datetime[is.na(s_sz_df$datetime)] <- as.POSIXct(
+  rownames(s_sz_rec)[is.na(s_sz_df$datetime)], 
+  format = "%Y-%m-%d", tz = "UTC"
+) 
+final <-as.data.frame(s_sz_rec)
+## for a the Hill-slope HRUs with IDs 2487, 3598 and 5201 the start of the time series are
+View(s_sz_df[,c("1","2","4")])
+#>                     2487      3598      5201
+#> 2020-02-01 00:30:00    0 0.1312262 0.2608164
+#> 2020-02-02 00:30:00    0 0.1378564 0.2668815
+#> 2020-02-03 00:30:00    0 0.1405102 0.2691382
+#> 2020-02-04 00:30:00    0 0.1453311 0.2742745
+#> 2020-02-05 00:30:00    0 0.1495449 0.2785347
+#> 2020-02-06 00:30:00    0 0.1539169 0.2828957
+## and a plot can be generated
+names(s_sz_df)[-1] <- paste0("hru_", names(s_sz_df)[-1])
+row.names(s_sz_df) <- seq(1, length(s_sz_df$hru_0), 1)
+
+tibble(s_sz_df) %>% 
+ggplot()+
+  geom_line(aes(x = datetime, y = hru_24))
+```
+
+# SMITH STREAM NETWORK DEMO
+```{r GIS files}
+dem_path <- file.path(".", "unprocessed",
+                      "1m hydro enforced dem","hydem1mlpns.tif")
+dem <- rast(dem_path) # load the dem as a raster layer
+plot(dem)
+
+####delineate watershed and keep watershed boundary
+
+w3_breached <- "./unprocessed/demo/1mdem_breach.tif"
+wbt_breach_depressions_least_cost(
+  dem = dem_path,
+  output = w3_breached,
+  dist = 1,
+  fill = TRUE)
+
+w3_filled <- "./unprocessed/demo/1mdem_fill.tif"
+wbt_fill_depressions_wang_and_liu(
+  dem = w3_breached,
+  output = w3_filled
+)
+#calculate flow accumulation and direction
+w3_flowacc <- "./unprocessed/demo/1mdem_w3_flowacc.tif"
+wbt_d8_flow_accumulation(input = w3_filled,
+                         output = w3_flowacc)
+w3_d8pt <- "./unprocessed/demo/1mdem_w3_d8pt.tif"
+wbt_d8_pointer(dem = w3_filled,
+               output = w3_d8pt)
+
+#delineate streams
+w3_streams_60000 <- "./unprocessed/demo/w3_streams_60000.tif"
+wbt_extract_streams(flow_accum = w3_flowacc,
+                    output = w3_streams_60000,
+                    threshold = 60000)
+
+# crop DEM to a rough rectangle
+#old bounds
+ybounds <- c(4870350,4871350)
+xbounds <- c(281350, 282150)
+# new bounds
+xbounds <-c(280060, 282740)
+ybounds <-   c(4869850,4871650)
+crop1 <- crop(rast(w3_filled), ext(c(xbounds, ybounds)))
+plot(crop1)
+
+# convert streams to shapefile
+w3_streams60000_vect <- "./unprocessed/demo/w3_streams60000_vect.shp"
+wbt_raster_streams_to_vector(streams = w3_streams_60000,
+                             d8_pntr = w3_d8pt,
+                             output = w3_streams60000_vect)
+streams20k <- vect(w3_streams20000_vect)
+streams60k <- vect(w3_streams60000_vect)
+
+plot(streams_8000)
+streams_8000 <- vect(w3_streams_vect)
+crs(streams_8000) <- crs(w3_outline)
+ggplot()+
+  theme_void()+
+   geom_sf(data = streams_8000, color = "#0096C7")
+  # geom_sf(data = streams20k, color = "darkblue")+
+  # geom_sf(data = streams60k, color = "black")
+
+ggplot()+
+  theme_void()+
+  geom_sf(data = w3_outline, color = "#0096C7", fill = NA, lwd = 2)
+ggsave("w3_streams.png", scale = 3)
+```
+```{r convert channel}
+plot(channel)
+channel <- channel %>% 
+  mutate(ID = seq(1, n(), 1))
+# 2. Break multipart lines into individual components
+# This converts MULTILINESTRING to LINESTRING
+single_parts <- st_cast(as_sf(channel), "LINESTRING")
+
+# 3. View the new, broken-down data
+print(single_parts)
+plot(single_parts)
+coords <- st_coordinates(single_parts)
+
+
+net <- as_sfnetwork(single_parts, directed = TRUE)
+
+# Extract nodes
+nodes <- st_as_sf(net, "nodes")
+
+# Extract edges
+edges <- st_as_sf(net, "edges")
+
+edges$length_m <- st_length(edges)
+test <- 
+  edges %>% 
+  select(from, to, geometry, length_m) %>% 
+  mutate("Identifier" = dplyr::row_number()) %>% 
+  vect() #%>%
+
+crs(test) <- crs(dem_final)
+
+conv_channel <- convert_channel(
+    test,
+    property_names = c(name = "Identifier", 
+                       length = "length_m", startNode = "from",
+                       endNode= "to"),
+    default_width = 1,
+    default_slope = 0.001
+)
+
+writeVector(conv_channel,file.path(".","processed","channel.shp"),overwrite=TRUE)
+
+# name is different than the start and end nodes!
+conv_channel %>% 
+  as.data.frame() %>% 
+  tibble()
+```
+
+```{r}
+# Find the outlet ID right after you create your 'edges' object
+edges_df <- st_drop_geometry(edges)
+outlet_edge <- edges_df %>% filter(!(to %in% from))
+outlet_id <- outlet_edge$ID
+
+# Update your output definition using the correct outlet ID
+output_defn <- data.frame(name = "W3",
+                          id = outlet_id,
+                          flux = "q_sf",
+                          scale = 1)
+
+
+## create a vector of the uid's of the HRUs
+hid <- sapply(mdl$hru,function(h){h$id})
+## create a vector of the channel names with as storaged in the class variabel
+cname <- sapply(mdl$hru,function(h){h$class$name})
+idx <- match(gauges$chn_identi, cname) ## index of HRU's corresponding to gauges
+## create as a data.frame
+gauge_output <- data.frame(name = gauges$Site.Name,
+                           id = as.integer(hid[idx]),
+                           flux = "q_sf",
+                           scale = 1)
+saveRDS(gauge_output,file.path(".","dyna","gauge_output_defn.rds")) ## save the output for later use
+gauge_output
+```
+
+```{r}
+make_contours_sf <- function(r,
+                             interval = 10,
+                             major_interval = 50,
+                             crs_out = NULL) {
+
+  library(terra)
+  library(sf)
+  library(dplyr)
+
+  stopifnot(inherits(r, "SpatRaster"))
+
+  # ---- range ----
+  rng <- as.numeric(terra::minmax(r))
+
+  minor_levels <- seq(
+    floor(rng[1] / interval) * interval,
+    ceiling(rng[2] / interval) * interval,
+    by = interval
+  )
+
+  major_levels <- seq(
+    floor(rng[1] / major_interval) * major_interval,
+    ceiling(rng[2] / major_interval) * major_interval,
+    by = major_interval
+  )
+
+  # ---- create contours ----
+  minor <- terra::as.contour(r, levels = minor_levels)
+  major <- terra::as.contour(r, levels = major_levels)
+
+  names(minor)[1] <- "elev"
+  names(major)[1] <- "elev"
+
+  minor$type <- "minor"
+  major$type <- "major"
+
+  contours_sf <- sf::st_as_sf(rbind(minor, major))
+
+  if (!is.null(crs_out)) {
+    contours_sf <- sf::st_transform(contours_sf, crs_out)
+  }
+
+  # =====================================================
+  # SAFE LABEL GENERATION (geometry-agnostic)
+  # =====================================================
+
+  major_sf <- contours_sf |> dplyr::filter(type == "major")
+
+  # detect geometry types
+  gtypes <- unique(sf::st_geometry_type(major_sf))
+
+  # only extract if collections exist
+  if ("GEOMETRYCOLLECTION" %in% gtypes) {
+    major_sf <- sf::st_collection_extract(major_sf, "LINESTRING")
+  }
+
+  # ensure LINESTRING geometries
+  major_sf <- sf::st_cast(major_sf, "LINESTRING", warn = FALSE)
+
+  # remove empty features
+  major_sf <- major_sf[!sf::st_is_empty(major_sf), ]
+
+  # midpoint label placement
+  labels_sf <- sf::st_line_sample(major_sf, sample = 0.5) |>
+    sf::st_cast("POINT")
+
+  labels_sf$elev <- major_sf$elev
+
+  list(
+    contours = contours_sf,
+    labels   = labels_sf
+  )
+}
+
+surface_conts <- make_contours_sf(
+  crop1,
+  interval = 10,
+  major_interval = 50
+)
+
+  ggplot() +
+  theme_void()+
+  geom_sf(data = surface_conts$contours,
+          aes(alpha = type), color = "saddlebrown") +
+      geom_sf(data = w3_outline, colour = "#0096C7", lwd = 2, fill = NA) +
+    geom_sf(data = streams_8000, color = "#023E8A")+
+     geom_sf_label(data = surface_conts$labels[1:8],
+               aes(label = surface_conts$labels$elev),
+               size = 3,
+               fill = "#EDF1DE",
+               border.color = NA,
+               label.padding = unit(0.1, "lines")) +
+  scale_alpha_manual(
+    values = c(minor = 0.3,
+               major = 1),
+    guide = "none")+
+    
+    lims(x = c(280060, 282740),
+         y = c(4869850,4871650))+
+  labs(title = "A. 10m surface topography contours")+
+      theme(panel.background = element_rect(fill = "#EDF1DE"))
+
+  ggsave("contours_aquaincog.png", scale = 2)
+```
+
+
+```{r}
+
 ```
 
