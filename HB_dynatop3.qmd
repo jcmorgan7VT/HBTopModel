@@ -1,0 +1,2791 @@
+---
+title: "HB_dynatop3"
+format: html
+editor_options: 
+  chunk_output_type: console
+---
+Clean run through with snow
+
+Make a model from start to finish. 
+
+Use base dynaGIS to create model, then add snow parameters.
+```{r setup}
+# Load packages
+library(pacman)
+p_load(terra, xts, whitebox, tidyverse,
+       lubridate,
+       dynatopGIS,
+       sf, # working with st and sf objects
+       tidyterra, # do tidy ops on terra objects
+       sfnetworks, # create start and end nodes for channel network
+       lwgeom,
+       lhs, DEoptim, # maybe obsolete since I am using GLUE
+       parallel,
+       readr
+       )
+
+
+# Load modified version of dynatop, which includes snow routine
+devtools::load_all(file.path("/Users/johnmorgan/Documents/HBTopModel/revised_package/dynatop")) ## attach the revised package
+
+crs1 <- "PROJCRS[\"NAD83 / UTM zone 19N\",\n    BASEGEOGCRS[\"NAD83\",\n        DATUM[\"North American Datum 1983\",\n            ELLIPSOID[\"GRS 1980\",6378137,298.257222101,\n                LENGTHUNIT[\"metre\",1]]],\n        PRIMEM[\"Greenwich\",0,\n            ANGLEUNIT[\"degree\",0.0174532925199433]],\n        ID[\"EPSG\",4269]],\n    CONVERSION[\"UTM zone 19N\",\n        METHOD[\"Transverse Mercator\",\n            ID[\"EPSG\",9807]],\n        PARAMETER[\"Latitude of natural origin\",0,\n            ANGLEUNIT[\"degree\",0.0174532925199433],\n            ID[\"EPSG\",8801]],\n        PARAMETER[\"Longitude of natural origin\",-69,\n            ANGLEUNIT[\"degree\",0.0174532925199433],\n            ID[\"EPSG\",8802]],\n        PARAMETER[\"Scale factor at natural origin\",0.9996,\n            SCALEUNIT[\"unity\",1],\n            ID[\"EPSG\",8805]],\n        PARAMETER[\"False easting\",500000,\n            LENGTHUNIT[\"metre\",1],\n            ID[\"EPSG\",8806]],\n        PARAMETER[\"False northing\",0,\n            LENGTHUNIT[\"metre\",1],\n            ID[\"EPSG\",8807]]],\n    CS[Cartesian,2],\n        AXIS[\"(E)\",east,\n            ORDER[1],\n            LENGTHUNIT[\"metre\",1]],\n        AXIS[\"(N)\",north,\n            ORDER[2],\n            LENGTHUNIT[\"metre\",1]],\n    USAGE[\n        SCOPE[\"Engineering survey, topographic mapping.\"],\n        AREA[\"North America - between 72°W and 66°W - onshore and offshore. Canada - Labrador; New Brunswick; Nova Scotia; Nunavut; Quebec. Puerto Rico. United States (USA) - Connecticut; Maine; Massachusetts; New Hampshire; New York (Long Island); Rhode Island; Vermont.\"],\n        BBOX[14.92,-72,84,-66]],\n    ID[\"EPSG\",26919]]"
+```
+
+# GIS PREP
+```{r GIS files}
+dem_path <- file.path(".", "hb_data", "unprocessed",
+                      "1m hydro enforced dem","hydem1mlpns.tif")
+dem <- rast(dem_path) # load the dem as a raster layer
+plot(dem)
+
+# crop DEM to a rough rectangle
+ybounds <- c(4870350,4871350)
+xbounds <- c(281350, 282150)
+crop1 <- crop(dem, ext(c(xbounds, ybounds)))
+plot(crop1)
+crop_dem_path <- file.path(".", "hb_data", "unprocessed",
+                      "1m hydro enforced dem","hydem1mlpns_cropped.tif")
+writeRaster(crop1, crop_dem_path, overwrite = TRUE)
+####delineate watershed and keep watershed boundary
+
+w3_breached <- "./hb_data/unprocessed/whitebox_outputs/1mdem_breach.tif"
+wbt_breach_depressions_least_cost(
+  dem = crop_dem_path,
+  output = w3_breached,
+  dist = 1,
+  fill = TRUE)
+
+w3_filled <- "./hb_data/unprocessed/whitebox_outputs/1mdem_fill.tif"
+wbt_fill_depressions_wang_and_liu(
+  dem = w3_breached,
+  output = w3_filled
+)
+#calculate flow accumulation and direction
+w3_flowacc <- "./hb_data/unprocessed/whitebox_outputs/1mdem_w3_flowacc.tif"
+wbt_d8_flow_accumulation(input = w3_filled,
+                         output = w3_flowacc)
+w3_d8pt <- "./hb_data/unprocessed/whitebox_outputs/1mdem_w3_d8pt.tif"
+wbt_d8_pointer(dem = w3_filled,
+               output = w3_d8pt)
+
+#delineate streams
+w3_streams <- "./hb_data/unprocessed/whitebox_outputs/w3_streams.tif"
+wbt_extract_streams(flow_accum = w3_flowacc,
+                    output = w3_streams,
+                    threshold = 8000)
+plot(rast(w3_streams))
+
+# convert streams to shapefile
+w3_streams_vect <- "./hb_data/unprocessed/whitebox_outputs/w3_streams_vect.shp"
+wbt_raster_streams_to_vector(streams = w3_streams,
+                             d8_pntr = w3_d8pt,
+                             output = w3_streams_vect)
+plot(vect(w3_streams_vect))
+
+# get pour point ready
+pour_point_path <- file.path(".", "hb_data",
+                             "unprocessed",
+                             "1m hydro enforced dem", "w3_pour_snap.shp")
+plot(vect(pour_point_path), add = TRUE)
+
+w3_pour_snap <- "./hb_data/unprocessed/whitebox_outputs/w3_pour_snap.shp"
+wbt_jenson_snap_pour_points(pour_pts = pour_point_path,
+                            streams = w3_streams,
+                            output = w3_pour_snap,
+                            snap_dist = 10)
+w3_pour_snap_read <- vect(w3_pour_snap)
+plot(rast(w3_streams), 
+     xlim = c(281400, 282000),
+     ylim = c(4870400, 4870800))
+points(w3_pour_snap_read, pch = 1)
+
+
+w3_shed <- "./hb_data/unprocessed/whitebox_outputs/w3_shed.tif"
+wbt_watershed(d8_pntr = w3_d8pt,
+              pour_pts = w3_pour_snap,
+              output = w3_shed)
+
+plot(rast(w3_shed))
+#convert raster of watershed area to vector for final mapping
+w3_outline <- as.polygons(rast(w3_shed), extent=FALSE)
+plot(w3_outline)
+
+plot(w3_outline)
+
+channel <- vect(w3_streams_vect, crs = crs1) %>% 
+  crop(w3_outline)
+
+
+# crop and mask DEM by watershed outline
+dem_crop_mask <- rast(w3_filled) %>% 
+  crop(w3_outline) %>% 
+  mask(w3_outline)
+
+#create watershed area, just use area of DEM
+outline <- (dem_crop_mask * 0) + 1
+# extend both rasters by 1 pixel
+outline_extended <- extend(outline,1)
+dem_final <- extend(dem_crop_mask,1)
+
+
+writeRaster(outline_extended,file.path(".", "hb_data", "processed","w3.tif"),overwrite=TRUE)
+writeRaster(dem_final,file.path(".", "hb_data", "processed","dem.tif"),overwrite=TRUE)
+```
+```{r build channel}
+# =============================================================================
+# build_dynatop_channel.R  (v3 — definitive)
+#
+# ROOT CAUSE (discovered from HRU 39 endNode=30, sf_flow_direction=47):
+#   convert_channel sets each channel HRU's id    = startNode value
+#                                    sf_flow_dir  = endNode value
+#   It never uses the 'name' column for ordering.
+#
+# Therefore the startNode/endNode values in the SpatVector passed to
+# convert_channel MUST themselves be topologically ordered integers:
+#   outlet segment startNode = 1 (lowest)
+#   every upstream segment startNode > its downstream segment's startNode
+#
+# All previous scripts sorted rows and assigned 'name' = 1..N but left the
+# original sfnetwork-derived node ids in startNode/endNode untouched.
+# Those arbitrary node ids (e.g. 30, 47) are what convert_channel actually
+# uses, so the ordering we imposed on 'name' had no effect.
+#
+# This script replaces startNode/endNode with fresh topological ids BEFORE
+# calling convert_channel.
+# =============================================================================
+
+locs <- read_csv("/Users/johnmorgan/Documents/VT Research/HBTopModel/STIC_synthesis/04_Locations/Location_hb_W3.csv") %>% 
+  mutate(sensor_name = substr(sensor_name, 4, 5)) %>% 
+  filter(sensor_name != "st")
+
+# for project to work, I have to specify projection of vect when converting from df to vect
+locs_vect <- vect(locs, 
+                   geom=c("longitude", "latitude"), 
+                   crs = "+proj=longlat +datum=WGS84")
+#reproject coordinates from WGS84 to NAD83 19N, which is the projection of raster
+locs_projected <- terra::project(locs_vect, crs1)
+plot(locs_projected)
+
+## They've been trying to stop the wave, but the wave don't stop
+channel <- vect(w3_streams_vect, crs = crs1) %>% 
+  crop(w3_outline) %>% 
+    mutate(ID = seq(1, n(), 1))
+
+plot(channel)
+
+ggplot()+
+  geom_spatvector(data = channel)+
+  geom_spatvector_text(data = channel, aes(label = ID))
+channel_trimmed <- channel %>%
+  filter(!ID %in% c(1, 4, 9, 5))
+
+ggplot()+
+  geom_spatvector(data = channel_trimmed)+
+  geom_spatvector_text(data = channel_trimmed, aes(label = ID))
+
+test2 <- terra::aggregate(channel_trimmed)
+
+new_data <- data.frame(ID = 1)
+values(test2) <- new_data
+
+ggplot()+
+  geom_spatvector(data = test2)+
+  geom_spatvector_text(data = test2, aes(label = ID))
+
+test3 <- terra::aggregate(channel_trimmed)
+
+# =============================================================================
+# Main function
+# =============================================================================
+
+#' Build a topologically correct channel SpatVector for dynatop
+#'
+#' @param channel_sv       SpatVector of directed channel lines (upstream to downstream).
+#' @param split_points_sv  SpatVector of points marking desired HRU boundaries.
+#' @param snap_tolerance   Max snap distance in map units. Points beyond this warn.
+#' @param node_tolerance   Coordinate precision for merging coincident endpoints.
+#' @param default_width    Channel width assigned to all segments.
+#' @param default_slope    Slope assigned to all segments.
+#'
+#' @return List with three elements:
+#'   $channel_sv    SpatVector ready for convert_channel. startNode values are
+#'                  topological ids (outlet = 1). endNode = downstream id (0 at outlet).
+#'   $channel_df    data.frame of the same, for inspection and validation.
+#'   $conv_channel  Output of convert_channel — pass directly to dynatop.
+
+build_dynatop_channel <- function(
+    channel_sv,
+    split_points_sv,
+    snap_tolerance = 1,
+    node_tolerance = 0.01,
+    default_width  = 1,
+    default_slope  = 0.001
+) {
+
+  # ── 0. CRS alignment ─────────────────────────────────────────────────────────
+  channel_sf <- st_cast(st_as_sf(channel_sv), "LINESTRING")
+  points_sf  <- st_as_sf(split_points_sv)
+  if (st_crs(channel_sf) != st_crs(points_sf)) {
+    message("CRS mismatch — reprojecting split points.")
+    points_sf <- st_transform(points_sf, st_crs(channel_sf))
+  }
+  message(sprintf("Input: %d line feature(s), %d split point(s).",
+                  nrow(channel_sf), nrow(points_sf)))
+
+  # ── 1. Snap split points to nearest position on the channel ──────────────────
+  channel_union <- st_union(channel_sf)
+  nearest_segs  <- st_nearest_points(points_sf, channel_union)
+  snapped_pts   <- st_cast(nearest_segs, "POINT")[seq(2, 2*nrow(points_sf), 2)]
+
+  snap_dists <- as.numeric(st_distance(
+    points_sf, st_sf(geometry = snapped_pts), by_element = TRUE
+  ))
+  far <- which(snap_dists > snap_tolerance)
+  if (length(far) > 0)
+    warning(sprintf("%d point(s) >%g map units from channel (rows: %s).",
+                    length(far), snap_tolerance, paste(far, collapse=",")),
+            call.=FALSE)
+
+  # ── 2. Split each line at points that fall on it ──────────────────────────────
+  segment_list <- vector("list", nrow(channel_sf))
+  for (i in seq_len(nrow(channel_sf))) {
+    this_line    <- channel_sf[i, ]
+    dist_to_line <- as.numeric(st_distance(st_sf(geometry = snapped_pts), this_line))
+    on_this      <- which(dist_to_line <= node_tolerance * 10)
+
+    if (length(on_this) == 0) {
+      segment_list[[i]] <- st_sf(geometry = st_geometry(this_line))
+    } else {
+      pts_u <- st_union(snapped_pts[on_this])
+      parts <- tryCatch(
+        st_collection_extract(lwgeom::st_split(this_line, pts_u), "LINESTRING"),
+        error = function(e) {
+          warning(sprintf("Split failed on line %d — kept unsplit.", i), call.=FALSE)
+          this_line
+        }
+      )
+      segment_list[[i]] <- st_sf(geometry = st_geometry(parts))
+    }
+  }
+
+  all_segs <- do.call(rbind, segment_list)
+  rownames(all_segs) <- NULL
+  n_segs <- nrow(all_segs)
+  message(sprintf("After splitting: %d segment(s).", n_segs))
+
+  # ── 3. Build coordinate-based node topology ────────────────────────────────
+  # Directed lines: first coordinate = upstream end, last = downstream end.
+  precision <- max(0, ceiling(-log10(node_tolerance)) + 1)
+  get_endpoints <- function(geom) {
+    co <- st_coordinates(geom)
+    rbind(round(co[1,        c("X","Y")], precision),
+          round(co[nrow(co), c("X","Y")], precision))
+  }
+
+  ep_matrix   <- do.call(rbind, lapply(seq_len(n_segs), function(i) get_endpoints(all_segs[i,])))
+  coord_keys  <- paste(ep_matrix[,"X"], ep_matrix[,"Y"])
+  unique_keys <- unique(coord_keys)
+  node_ids    <- match(coord_keys, unique_keys)
+  start_ids   <- node_ids[seq(1, 2*n_segs, 2)]  # coord-based, arbitrary integers
+  end_ids     <- node_ids[seq(2, 2*n_segs, 2)]
+
+  # ── 4. Topological sort — BFS from outlet ────────────────────────────────────
+  sn_to_row <- setNames(seq_len(n_segs), as.character(start_ids))
+  ds        <- unname(sn_to_row[as.character(end_ids)])  # NA = outlet
+
+  outlets <- which(is.na(ds))
+  if (length(outlets) == 0)
+    stop(paste0(
+      "No outlet found — every segment's end connects to another segment's start.\n",
+      "Verify that lines are directed upstream → downstream."
+    ))
+  if (length(outlets) > 1)
+    warning(sprintf(
+      "%d outlets detected — network may be disconnected or have unjoined tributaries.",
+      length(outlets)
+    ), call.=FALSE)
+
+  upstream_of <- vector("list", n_segs)
+  for (i in seq_len(n_segs))
+    if (!is.na(ds[i])) upstream_of[[ds[i]]] <- c(upstream_of[[ds[i]]], i)
+
+  visited   <- logical(n_segs)
+  new_order <- integer(0)
+  queue     <- outlets
+  while (length(queue) > 0) {
+    cur <- queue[1]; queue <- queue[-1]
+    if (!visited[cur]) {
+      visited[cur] <- TRUE
+      new_order    <- c(new_order, cur)
+      queue        <- c(queue, upstream_of[[cur]])
+    }
+  }
+
+  unreachable <- setdiff(seq_len(n_segs), new_order)
+  if (length(unreachable) > 0)
+    warning(sprintf(
+      "%d segment(s) unreachable from the outlet — possible cycle or disconnected sub-network.",
+      length(unreachable)
+    ), call.=FALSE)
+
+  n_sorted <- length(new_order)
+
+  # ── 5. THE KEY STEP: replace startNode/endNode with topological ids ───────────
+  #
+  # convert_channel uses startNode as each HRU's id, and endNode as its
+  # sf_flow_direction. So these values — not 'name', not row order — must be
+  # topologically ordered so that endNode < startNode for every non-outlet.
+  #
+  # BFS order gives us: new_order[1] = outlet row, new_order[n] = headwaters.
+  # Assign topo_id = position in new_order, so outlet gets topo_id = 1.
+  # Each segment's downstream row has a LOWER topo_id by construction.
+
+  topo_id   <- seq_len(n_sorted)  # 1 = outlet, n_sorted = farthest headwater
+
+  # Find downstream topo_id for each sorted segment
+  sorted_start_orig <- start_ids[new_order]
+  sorted_end_orig   <- end_ids[new_order]
+  sn_orig_to_sorted_row <- setNames(seq_len(n_sorted), as.character(sorted_start_orig))
+  ds_sorted <- unname(sn_orig_to_sorted_row[as.character(sorted_end_orig)])  # NA = outlet
+
+  # New startNode = this segment's topo_id
+  # New endNode   = downstream segment's topo_id; 0 for outlet
+  new_startNode <- topo_id
+  new_endNode   <- ifelse(is.na(ds_sorted), 0L, topo_id[ds_sorted])
+
+  # Guarantee: for all non-outlet, new_endNode < new_startNode
+  # Because ds_sorted[i] < i always (BFS visits downstream before upstream)
+  violations <- which(new_endNode != 0 & new_endNode >= new_startNode)
+  if (length(violations) > 0)
+    stop(sprintf(
+      "BUG: topological id assignment still has violations at sorted rows: %s.\n",
+      paste(violations, collapse=", ")
+    ), "Please file a bug report.")
+
+  sorted_lengths <- as.numeric(st_length(all_segs[new_order, ]))
+
+  # ── 6. Assemble output ───────────────────────────────────────────────────────
+  channel_df <- data.frame(
+    name      = topo_id,          # label = id for clarity; convert_channel reads this as label only
+    startNode = new_startNode,    # THIS is what becomes the HRU id in dynatop
+    endNode   = new_endNode,      # THIS is what becomes sf_flow_direction
+    length    = sorted_lengths,
+    width     = default_width,
+    slope     = default_slope,
+    area      = sorted_lengths * default_width,
+    stringsAsFactors = FALSE
+  )
+
+  sorted_geom    <- st_geometry(all_segs[new_order, ])
+  channel_sf_out <- st_sf(channel_df, geometry = sorted_geom)
+  channel_sv_out <- vect(channel_sf_out)
+  crs(channel_sv_out) <- crs(channel_sv)
+
+  # ── 7. Pre-flight validation ──────────────────────────────────────────────────
+  validate_channel_sv(channel_sv_out, verbose = TRUE)
+
+  # ── 8. Run convert_channel ───────────────────────────────────────────────────
+  conv_channel <- convert_channel(
+    channel_sv_out,
+    property_names = c(
+      name      = "name",
+      length    = "length",
+      startNode = "startNode",
+      endNode   = "endNode"
+    ),
+    default_width = default_width,
+    default_slope = default_slope
+  )
+
+  list(
+    channel_sv   = channel_sv_out,
+    channel_df   = channel_df,
+    conv_channel = conv_channel
+  )
+}
+
+
+# =============================================================================
+# Validation: checks the rule as convert_channel sees it
+#   id = startNode; sf_flow_direction = endNode
+#   => endNode must be strictly less than startNode for every non-outlet row
+# =============================================================================
+
+#' Validate a channel SpatVector before passing to convert_channel
+#'
+#' @param sv       SpatVector with startNode, endNode columns.
+#' @param verbose  Print results.
+#' @return Logical TRUE (pass) / FALSE (fail), invisibly.
+
+validate_channel_sv <- function(sv, verbose = TRUE) {
+  df <- as.data.frame(sv)
+
+  outlet_rows <- df$endNode == 0 | !df$endNode %in% df$startNode
+  bad         <- which(!outlet_rows & df$endNode >= df$startNode)
+
+  if (verbose) {
+    message(sprintf(
+      "Segments: %d | Outlet startNode(s): %s | Violations: %d",
+      nrow(df),
+      paste(df$startNode[outlet_rows], collapse=", "),
+      length(bad)
+    ))
+    if (length(bad) > 0) {
+      message("Violations (endNode must be < startNode for non-outlet segments):")
+      print(df[bad, c("name","startNode","endNode")], row.names=FALSE)
+    } else {
+      message("PASS — startNode/endNode ordering is correct for convert_channel and dynatop.")
+    }
+  }
+  invisible(length(bad) == 0)
+}
+
+
+# =============================================================================
+# Usage
+# =============================================================================
+#
+result <- build_dynatop_channel(
+  channel_sv      = test3,
+  split_points_sv = locs_projected,
+  snap_tolerance  = 5,
+  node_tolerance  = 0.01,
+  default_width   = 1,
+  default_slope   = 0.001
+)
+
+writeVector(
+  result$conv_channel,
+  file.path(".", "hb_data", "processed", "channel.shp"),
+  overwrite = TRUE
+)
+
+# # Inspect the final table — startNode IS the HRU id, endNode IS sf_flow_direction
+print(result$channel_df)
+plot(result$channel_sv)
+
+plot(st_as_sf(result$channel_sv))
+#
+# # result$conv_channel is already the convert_channel output — use directly:
+# ctch_mdl <- dynatop$new(hru)   # where hru includes result$conv_channel
+#
+# # You can also re-validate at any time:
+ validate_channel_sv(result$channel_sv)
+ 
+ ggplot() +
+  # Plot the raster base map (using factor for discrete colors)
+  geom_spatvector(data = result$channel_sv) +
+  geom_spatvector_text(data = result$channel_sv, aes(label = name))
+  
+  geom_text(data = centroid_coords[4,], aes(x = x, y = y, label = hru_id), 
+            color = "black", fontface = "bold", size = 4) +
+  # Use a nice color palette and remove the bulky legend
+  scale_fill_viridis_d(option = "turbo", na.value = "transparent", guide = "none") +
+  lims(x = c(281500, 281700),
+       y = c(4870400, 4870500))+
+  theme_minimal() +
+  labs(title = "Hubbard Brook HRU & Channel ID Map",
+       subtitle = "Hillslopes (1-20) and Channels (21+)",
+       x = "Longitude", y = "Latitude")
+```
+
+```{r}
+sv <- result$channel_sv
+# Convert to sf
+sv_sf <- st_as_sf(sv)
+
+# Function to merge selected names into single row
+#merge_by_names <- function(sv_sf, names_to_merge, new_name) {
+names_to_merge <- c(1,2,3,4, 5)
+# Keep rows NOT in the merge list
+others <- sv_sf[!sv_sf$name %in% names_to_merge, ]
+  
+  # Combine selected lines
+  to_merge <- sv_sf[sv_sf$name %in% names_to_merge, ]
+  plot(to_merge)
+  merged_geom <- st_union(st_geometry(to_merge))
+  plot(merged_geom)
+  # New row for merged lines
+# figure out rows that will need endNode fixed
+new_ends <- sv_sf %>% 
+  filter(endNode %in% names_to_merge) %>% 
+  filter(!name %in% names_to_merge)
+
+
+merged_row <- st_sf(
+  name = 1,
+  startNode = 1,
+  endNode = 0,
+  length = sum(to_merge$length),
+  width = 1,
+  slope = 0.001,
+  area = sum(to_merge$area),
+  geometry = merged_geom
+)
+  
+  # Bind back together and convert
+all_rows <- rbind(merged_row, others)
+all_rows$endNode[which(all_rows$name %in% new_ends$name)] <- 1
+
+vect_final <- vect(all_rows)
+plot(vect_final)
+
+ggplot() +
+  # Plot the raster base map (using factor for discrete colors)
+  geom_spatvector(data = vect_final) +
+  geom_spatvector_text(data = vect_final, aes(label = name))#+
+  
+  
+  # Use a nice color palette and remove the bulky legend
+  scale_fill_viridis_d(option = "turbo", na.value = "transparent", guide = "none") +
+  lims(x = c(281500, 281700),
+       y = c(4870400, 4870500))+
+  theme_minimal() 
+
+  
+writeVector(
+  vect_final,
+  file.path(".", "hb_data", "processed", "channel.shp"),
+  overwrite = TRUE
+)
+```
+
+
+# TIMESERIES
+```{r}
+start <- "2023-05-21"
+end <- "2024-05-31"
+```
+
+```{r discharge}
+
+
+# discharge every 15 mins
+flow_15min <- read_csv("https://pasta.lternet.edu/package/data/eml/knb-lter-hbr/1/18/1b101627265d0b5763fa0bba93d93bf7") 
+
+flow_xts <- 
+  flow_15min %>%
+  filter(DATETIME >= start,
+         DATETIME <= end) %>% 
+  # Create a new column that groups time into 15-minute buckets
+  mutate(time_15 = floor_date(DATETIME, "15 mins")) %>%
+  # Group by those buckets
+  group_by(time_15) %>%
+  # Average the 5-minute instantaneous rates to get the 15-minute rate
+  summarize(Discharge_ls = mean(Discharge_ls, na.rm = TRUE)) %>%
+  # convert to m3_s, or should it be m3/day?>
+  mutate(Discharge_m3_s = Discharge_ls / 1000) %>% 
+  as.xts()
+
+```
+Units of precipitation and pet are expected to be m accrued over the previous timestep.
+```{r precipitation}
+precip <- read_csv("https://pasta.lternet.edu/package/data/eml/knb-lter-hbr/278/7/132ffe0622ff3f30505c774d24a6b65d")
+# precip in mm accrued over timestep, needs to be m accrued over time step
+
+precip_xts <- 
+  precip %>% 
+  filter(DateTime >= start,
+         DateTime <= end) %>% 
+  select(DateTime, precip) %>% 
+  mutate(precip = precip / 1000) %>% # convert to m
+  as.xts()
+```
+```{r pet}
+# air temp already 15 min increment
+air <- read_csv("https://pasta.lternet.edu/package/data/eml/knb-lter-hbr/322/7/a96172a26f381b9ec7005144d12e0820")
+
+air_formatted <- air %>% 
+  filter(DateTime >= start,
+         DateTime <= end) %>% 
+  select(DateTime, airTemp) 
+
+# convert airTemp to pet with hargreaves
+
+lat <- 45   # latitude in decimal degrees (e.g., Blacksburg VA)
+
+# --- Hargreaves PET -----------------------------------------------------
+
+hargreaves_pet <- function(date, temp, lat){
+
+  J <- yday(date)                 # day of year
+  phi <- lat * pi/180             # latitude radians
+  
+  # extraterrestrial radiation (Ra)
+  dr  <- 1 + 0.033*cos(2*pi*J/365)
+  delta <- 0.409*sin(2*pi*J/365 - 1.39)
+  ws <- acos(-tan(phi)*tan(delta))
+
+  Gsc <- 0.0820   # MJ m-2 min-1
+  
+  Ra <- (24*60/pi) * Gsc * dr *
+        (ws*sin(phi)*sin(delta) +
+         cos(phi)*cos(delta)*sin(ws))
+
+  PET <- 0.0023 * Ra *
+         (temp + 17.8) *
+         sqrt(pmax(temp, 0))
+
+  return(PET)   # mm/day
+}
+
+# --- Calculate PET ------------------------------------------------------
+
+air_formatted$PET_mm_day <- hargreaves_pet(
+  air_formatted$DateTime,
+  air_formatted$airTemp,
+  lat
+)
+
+
+pet_xts <- air_formatted %>% 
+  select(DateTime, PET_mm_day, airTemp) %>% 
+  mutate(PET_m_day = PET_mm_day / (1000 * 96)) %>% # convert to m, and 15 min
+  rename(pet = PET_m_day) %>% 
+  select(DateTime, pet, airTemp) %>% 
+  as.xts()
+
+ 
+```
+```{r combine}
+
+obs <- merge(flow_xts[,2], # flow does not go beyond 2024-05-31 23:45:00
+             precip_xts,
+             pet_xts,
+             all=FALSE) ## merge by time stamp
+#obs <- obs[ , colSums(is.na(obs)) == 0]               # Remove columns with at least one NA
+
+# Save it
+saveRDS(obs, file.path(".", "hb_data", "processed", "obs.rds"))
+
+obs <- readRDS(file.path(".", "hb_data", "processed", "obs.rds"))
+names(obs) <- c("Discharge_m3_s", "precip","pet","temp_series" )
+
+#saveRDS(obs, file.path(".", "processed", "obs.rds"))
+```
+
+# CREATE DYNATOP OBJECT
+```{r}
+ctch <- dynatopGIS$new(file.path(".", "dynaGISgoodChannel"))
+# add catchment, DEM, channel
+ctch$add_catchment( "./hb_data/processed/w3.tif")
+ctch$add_dem( "./hb_data/processed/dem.tif")
+ctch$add_channel( "./hb_data/processed/channel.shp")
+
+ctch$get_layer()
+
+# plot just to check it out!
+ctch$plot_layer("dem", add_channel=TRUE)
+```
+
+```{r fill-sinks}
+ctch$sink_fill()
+
+terra::plot( ctch$get_layer('filled_dem') - ctch$get_layer('dem'),
+             main="Changes to height")
+```
+
+```{r compute-stuff}
+# bands
+ctch$compute_band()
+ctch$plot_layer("band")
+# twi
+ctch$compute_properties()
+ctch$plot_layer('atb')
+# flow lengths
+ctch$compute_flow_lengths(flow_routing="shortest")
+ctch$plot_layer("shortest_flow_length")
+```
+
+```{r classifying and cutting}
+## simple equally spaced cuts
+ctch$classify("atb_20","atb",20)
+ctch$plot_layer("atb_20")
+
+## use the quantile function of the raster package to compute breaks
+## note we need to include the min and max
+brk <- global(ctch$get_layer("atb"), fun=quantile,probs = seq(0, 1, length = 21),na.rm=T)
+ctch$classify("atb_20_equal","atb",brk)
+ctch$plot_layer("atb_20_equal")
+
+ctch$combine_classes("atb_20_subcatch",c("atb_20","catchment"))
+ctch$plot_layer("atb_20_subcatch")
+
+ctch$combine_classes("atb_20_subcatch_band",c("atb_20_subcatch","band"))
+ctch$plot_layer("atb_20_subcatch_band")
+```
+
+```{r create the model}
+ctch$create_model(file.path("./dynaGISgoodChannel","atb_20"), # name of new model
+                  "atb_20", # classification to base model on
+                  sf_opt="cnst",
+                  sz_opt="exp",
+                  )
+
+## load the model
+mdl <- readRDS( file.path(".","dynaGISgoodChannel","atb_20.rds")) ## read the model in
+#hru <- mdl$hru
+names(mdl)
+```
+
+# RUN MODEL
+```{r add snow parameters to model object}
+# 2. Patch the HRUs with snow parameters, temp linkages, and expanded states
+for (i in seq_along(mdl$hru)) {
+  
+  # A. Add the snow parameters
+  mdl$hru[[i]]$snow <- list(
+    type = "hbv",
+    parameters = c(T_T = 0.0, C_f = 2.5, C_wh = 0.1)
+  )
+  
+  # B. Add the temp linkage 
+  # Note: The original precip linkage uses 'name' and 'fraction'
+  # We will map it to a dummy "temp_series"
+  mdl$hru[[i]]$temp <- list(
+    name = "temp_series",
+    fraction = 1.0
+  )
+  
+  # C. Expand the states to include s_snow and s_liquid
+  mdl$hru[[i]]$states <- c(
+    mdl$hru[[i]]$states, 
+    s_snow = 0, 
+    s_liquid = 0
+  )
+}
+
+# fpar <- function(h){ ## h is the hru
+#     ## test if a channel
+#     if( !is.na(h$class$startNode) ){
+#         ## change type
+#         h$sf$type <- "cnst"
+#         h$sf$parameters["csf"] <- 1
+#     }
+#     h
+# }
+# mdl$hru <- lapply(mdl$hru, fpar)
+
+for(ii in seq_along(mdl$hru)){
+  is_channel <- !is.na(mdl$hru[[ii]]$class$endNode)
+  if(is_channel && mdl$hru[[ii]]$sf$type == "kin"){
+    mdl$hru[[ii]]$sf$parameters["t_raf"] <- 0
+    mdl$hru[[ii]]$sf$parameters["s_raf"] <- 0
+  }
+}
+
+```
+
+```{r plot HRUS}
+
+hru_map <- rast(mdl$map) 
+
+# Rename the raster layer so we can call it easily in ggplot
+names(hru_map) <- "hru_id"
+
+# 3. Convert the raster to polygons to calculate the center of each HRU
+hru_poly <- as.polygons(hru_map)
+
+# Calculate the centroids (center points) of each polygon for the text labels
+hru_centroids <- centroids(hru_poly)
+
+# Extract coordinates into a standard dataframe for ggplot
+centroid_coords <- crds(hru_centroids, df = TRUE)
+centroid_coords$hru_id <- hru_centroids$hru_id
+              # 4. Plot using tidyterra and ggplot2
+ggplot() +
+  # Plot the raster base map (using factor for discrete colors)
+  geom_spatraster(data = as.factor(hru_map)) +
+  # Overlay the polygon boundaries
+  #geom_spatvector(data = hru_poly, fill = NA, color = "black", linewidth = 0.3, alpha = 0.2) +
+  # Add the ID labels at the center of each HRU
+  geom_text(data = centroid_coords[4,], aes(x = x, y = y, label = hru_id), 
+            color = "black", fontface = "bold", size = 4) +
+  # Use a nice color palette and remove the bulky legend
+  scale_fill_viridis_d(option = "turbo", na.value = "transparent", guide = "none") +
+  lims(x = c(281500, 281700),
+       y = c(4870400, 4870500))+
+  theme_minimal() +
+  labs(title = "Hubbard Brook HRU & Channel ID Map",
+       subtitle = "Hillslopes (1-20) and Channels (21+)",
+       x = "Longitude", y = "Latitude")
+
+```
+
+```{r test run model}
+# Load previously created data
+output_defn <- data.frame(name = c("q_sf", "v_sf_rz"),
+                      id = 0,
+                      flux = c("s_sf", "v_sf_rz"),
+                      scale = c(1, -1/900))
+#mdl <- readRDS(file.path(".","dynaGIS","atb_20.rds"))
+#obs <- readRDS(file.path(".","processed","obs.rds"))
+# initialize dynatop object
+
+## determining the initial recharge rate ad setting it in the model
+# I think the same number is the watershed area...
+#r0 <- as.numeric(obs[1, "Streamflow"])#/ 86400
+#r0 <- as.numeric(obs$Streamflow[1])
+ r0 <- as.numeric(obs$Discharge_m3_s[1])#/ sum( sapply( hru, function(x){x$properties["area"]} ) )
+hru <- lapply(hru,function(h){h$initialisation["r_uz_sz_0"] <- r0;h})
+
+## the map input is only needed for visualisation
+ctch_mdl <- dynatop$new(mdl$hru, map = mdl$map
+  )$add_data( obs
+  )$initialise(
+  )$sim(mdl$output_flux
+  )
+
+
+# Gauge Flows
+sim_gauge <- ctch_mdl$get_output() ## extract the flow as an xts object
+head(sim_gauge)
+plot(sim_gauge[,1],main="Simulated and observed flows",
+     legend.loc='topright')
+plot(merge(sim_gauge, obs$Discharge_m3_s),main="Simulated and observed flows",
+     legend.loc='topright')
+
+
+new_mdl <- ctch_mdl$get_model() ## get the model structure from the dynatop object
+new_mdl[[1]]
+
+```
+
+# PARAMETERIZE
+```{r working param, but we can do better}
+# =============================================================================
+# dynatop Multi-Objective Calibration
+# Objectives: (1) Discharge fit via KGE
+#             (2) Flow presence/absence at channel observation points via CSI
+# =============================================================================
+
+# =============================================================================
+# 1. LOAD YOUR MODEL AND DATA
+# =============================================================================
+# fix these later
+# mdl <- readRDS(file.path(".", "dynaGIS", "atb_20.rds"))
+# obs <- readRDS(file.path(".", "processed", "obs.rds"))
+
+# obs must have columns: precip (m/step), pet (m/step), temp (°C), 
+#                        and your observed discharge column
+# Units should already be fixed (precip/pet in m, not mm)
+
+# Observed discharge time series (m³/s) — used for KGE
+
+cal_start <- as.POSIXct("2023-05-15", tz = "UTC")
+cal_end   <- as.POSIXct("2024-05-31", tz = "UTC")
+obs_cal   <- obs[index(obs) >= cal_start & index(obs) <= cal_end, ]
+obs_q <- obs$Discharge_m3_s
+obs_q <- obs[index(obs) >= cal_start & index(obs) <= cal_end, ]$Discharge_m3_s
+#actual <- obs$Discharge_m3_s
+
+# =============================================================================
+# 2. FLOW PRESENCE/ABSENCE OBSERVATIONS
+# =============================================================================
+# Format: data frame with columns:
+#   hru_id   — integer, which HRU to extract q_sf from (0-indexed, matching model)
+#   datetime — POSIXct
+#   observed — integer, 1 = flowing, 0 = dry
+#
+# If your observations are date ranges rather than individual timesteps, 
+# use the helper below to expand them first.
+
+# ── Option A: already have a long data frame ─────────────────────────────────
+# pa_obs <- read.csv("presence_absence.csv")
+# pa_obs$datetime <- as.POSIXct(pa_obs$datetime, tz = "UTC")
+all_24 <- read_csv("/Users/johnmorgan/Documents/VT Research/HBTopModel/STIC_Synthesis/all_24.csv")
+
+
+stic_locs <- all_24 %>% 
+  filter(wshed == "W3") %>% 
+  select(number, lat, long) %>% 
+  unique() %>% 
+  vect(geom = c("long", "lat"), crs = "EPSG:4326") %>% 
+  project(.,"EPSG:26919")
+
+
+
+
+dist_table <- tibble(distance(result$conv_channel, stic_locs))
+
+for(i in 1:length(stic_locs$number)){
+  stic <- stic_locs[i,]
+  dist_table <- (distance(stic_locs[i,], result$conv_channel))
+  index <- unname(which(dist_table == min(dist_table), arr.ind = TRUE)[,2])
+  
+  output <- tibble(ID = stic$number,
+                   channel_ID = result$conv_channel[index,]$name,
+                   
+                   dist = min(dist_table))
+  if(i == 1) all_out <- output
+  if(i > 1) all_out <- rbind(all_out, output)
+}
+
+chosen <- all_out %>% 
+  filter(dist <= 30)
+pa_obs <- 
+  all_24 %>% 
+  filter(wshed == "W3", number %in% chosen$ID) %>% 
+  select(datetime, number, wetdry) %>% 
+  rename(ID = number) %>% 
+  left_join(chosen, multiple = "first") %>% 
+  mutate(observed = as.integer(case_when(wetdry == "wet" ~ 1,
+                            wetdry == "dry" ~ 0)),
+         hru_id = as.integer(channel_ID),
+         datetime = as.POSIXct(datetime)) %>% 
+  select(hru_id, datetime, observed) %>% 
+  filter(datetime > start,
+         datetime < end)
+
+# ── Option B: expand date ranges to 15-min timesteps ─────────────────────────
+# Adapt this table to your actual observations:
+# pa_ranges <- data.frame(
+#   hru_id   = c(3L,  3L,  7L,  7L),   # HRU ids matching model (check with outlet loop)
+#   location = c("site_A", "site_A", "site_B", "site_B"),
+#   start    = as.POSIXct(c("2017-05-21", "2017-06-15",
+#                            "2017-06-01", "2017-07-01"), tz = "UTC"),
+#   end      = as.POSIXct(c("2017-06-14", "2017-07-21",
+#                            "2017-06-30", "2017-07-21"), tz = "UTC"),
+#   observed = c(1L, 0L, 1L, 0L)  # 1=flowing, 0=dry during that range
+# )
+
+# expand_pa_ranges <- function(ranges, obs_index){
+#   # obs_index: the index() of your obs xts object
+#   do.call(rbind, lapply(seq_len(nrow(ranges)), function(i){
+#     r   <- ranges[i, ]
+#     idx <- obs_index[obs_index >= r$start & obs_index <= r$end]
+#     if(length(idx) == 0) return(NULL)
+#     data.frame(hru_id   = r$hru_id,
+#                location = r$location,
+#                datetime = idx,
+#                observed = r$observed,
+#                stringsAsFactors = FALSE)
+#   }))
+# }
+# 
+# pa_obs <- expand_pa_ranges(pa_ranges, index(obs))
+
+# Threshold: simulated q_sf (m³/s) above which channel is "flowing"
+# Tune this to the detection limit of your field observations
+FLOW_THRESHOLD <- 1e-06  # m³/s — adjust to your watershed scale
+
+# =============================================================================
+# 3. PARAMETER SPACE DEFINITION
+# =============================================================================
+# Each row: parameter name, lower bound, upper bound
+# Adjust ranges to your watershed — these are reasonable starting points
+# for a mineral soil catchment
+
+param_bounds <- data.frame(
+  name  = c("t_0",      # saturated zone transmissivity at saturation (m²/s)
+             "m",        # exponential decay constant (m⁻¹)
+             "t_d",      # unsaturated zone time delay (s)
+             "s_rzmax",  # root zone max storage (m)
+             "c_sf",     # hillslope surface velocity (m/s) — if cnst sf type
+             "v_ch",     # channel surface velocity (m/s)
+             "T_T",     # snow/rain temperature threshold (°C)
+             "C_f",  # degree-day melt factor (m/°C/day)
+             "C_wh"),  # snowfall correction factor (-)
+  lower = c(0.001,  0.005,  0.1,   0.05,  0.1,  0.3, 0.0,  0.001,  0.5),
+  upper = c(5.0,    0.08,   8000,  0.5,   1.0,  2.0,  2.0,  0.008,  1.5),
+  stringsAsFactors = FALSE
+)
+n_params <- nrow(param_bounds)
+
+# =============================================================================
+# 4. MODEL RUNNER
+# =============================================================================
+# Takes a named parameter vector, sets it in the model, runs one simulation,
+# returns a list with simulated discharge xts and the full sim output
+
+#output_defn
+#ctch_mdl <- dynatop$new(Swindale$model$hru)$add_data(obs[,-1])$initialise()$sim(output_defn)
+
+test_params <- setNames(
+  (param_bounds$lower + param_bounds$upper) / 2,
+  param_bounds$name
+)
+#Swindale$model$map <- "./hb_data/dynaGIS/atb_20.tif"
+
+
+run_model <- function(params, mdl_template, obs,
+                      outlet_id   = 0L,
+                      pa_hru_ids  = unique(pa_obs$hru_id),
+                      sub_step    = 900){
+  
+  hru <- mdl_template$hru
+  
+  for(ii in seq_along(hru)){
+    is_channel <- !is.na(hru[[ii]]$class$endNode)
+    
+    if(!is_channel){
+      # ── Hillslope ──
+      hru[[ii]]$sz$parameters["t_0"]     <- params["t_0"]
+      hru[[ii]]$sz$parameters["m"]       <- params["m"]
+      hru[[ii]]$uz$parameters["t_d"]     <- params["t_d"]
+      hru[[ii]]$rz$parameters["s_rzmax"] <- params["s_rzmax"]
+      
+      # Surface type determines which parameter to set:
+      if(hru[[ii]]$sf$type == "cnst"){
+        hru[[ii]]$sf$parameters["c_sf"] <- params["c_sf"]
+      } else if(hru[[ii]]$sf$type == "kin"){
+        # kin type uses n (Manning) — optionally add "n" to param_bounds
+        # hru[[ii]]$sf$parameters["n"] <- params["n"]
+      }
+      
+    } else {
+      # ── Channel ──
+      hru[[ii]]$sz$parameters["t_0"]     <- 0.001          # keep low
+      hru[[ii]]$rz$parameters["s_rzmax"] <- 0.001
+      if(hru[[ii]]$sf$type == "cnst"){
+        hru[[ii]]$sf$parameters["c_sf"]  <- params["v_ch"]
+      }
+    }
+    
+    # ── Snow parameters (all HRUs) ──
+    hru[[ii]]$snow$parameters["T_T"]    <- params["T_T"]
+    hru[[ii]]$snow$parameters["C_f"] <- params["C_f"]
+    hru[[ii]]$snow$parameters["C_wh"]  <- params["C_wh"]
+    
+    # ── Initialisation ──
+    total_area <- sum(sapply(hru, function(h) h$properties["area"]))
+    baseflow   <- as.numeric(obs$Discharge_m3_s[1])
+    hru[[ii]]$initialisation["s_rz_0"]    <- 0.5
+    hru[[ii]]$initialisation["r_uz_sz_0"] <- baseflow / total_area
+  }
+  
+  # Build output definition: outlet discharge + presence/absence HRUs
+  pa_ids   <- unique(pa_hru_ids)
+  out_rows <- rbind(
+  data.frame(name  = "q_out",
+             id    = 0L,
+             flux  = "q_sf",
+             scale = 1,
+             stringsAsFactors = FALSE),
+  data.frame(name  = paste0("q_sf_hru", pa_ids),
+             id    = pa_ids,
+             flux  = "q_sf",
+             scale = 1,
+             stringsAsFactors = FALSE)
+)
+  
+  # Run
+  result <- tryCatch({
+    ctch_mdl <- dynatop$new(hru, map = mdl_template$map)
+    ctch_mdl$add_data(obs)
+    ctch_mdl$initialise()
+    ctch_mdl$sim(out_rows, sub_step = sub_step)$get_output()
+  # }, error = function(e){
+  #   NULL  # return NULL on failure — objective will return penalty
+  })
+  
+  return(result)
+}
+test_parms <- data.frame(
+  name = param_bounds$name,
+  value = c(exp(7.46), # t_0
+            0.00698, # m
+            8*60*60, # t_d
+            0.1, # s_rzmax
+            0.5425, #c_sf
+            1, # v_ch
+            0, # T_T
+            2.5, # C_f
+            0.1 # C_wh
+            )
+)
+test_params <- setNames(
+  test_parms$value,
+  test_parms$name
+)
+test_run <- run_model(test_params,
+          mdl,
+          obs,
+          outlet_id = 0L
+          )
+plot(test_run$q_out)
+# =============================================================================
+# 5. OBJECTIVE FUNCTION COMPONENTS
+# =============================================================================
+
+# ── KGE (Kling-Gupta Efficiency) for discharge ───────────────────────────────
+# KGE = 1 - sqrt((r-1)² + (α-1)² + (β-1)²)
+# r = correlation, α = std ratio, β = mean ratio
+# Returns value in (-Inf, 1]; 1 is perfect; > 0.5 is generally "good"
+kge <- function(sim, obs){
+  # align by time index
+  both  <- merge(sim, obs, join = "inner")
+  s     <- as.numeric(both[, 1])
+  o     <- as.numeric(both[, 2])
+  valid <- is.finite(s) & is.finite(o) & abs(s) < 1e6  # ADD abs check here
+  if(sum(valid) < 10) return(-Inf)
+  s <- s[valid]; o <- o[valid]
+  r   <- cor(s, o)
+  a   <- sd(s) / sd(o)
+  b   <- mean(s) / mean(o)
+  1 - sqrt((r - 1)^2 + (a - 1)^2 + (b - 1)^2)
+}
+
+# ── NSE alternative (uncomment to swap in) ───────────────────────────────────
+nse <- function(sim, obs){
+  both  <- merge(sim, obs, join = "inner")
+  s     <- as.numeric(both[, 1])
+  o     <- as.numeric(both[, 2])
+  valid <- is.finite(s) & is.finite(o)
+  if(sum(valid) < 10) return(-Inf)
+  s <- s[valid]; o <- o[valid]
+  1 - sum((s - o)^2) / sum((o - mean(o))^2)
+}
+
+# ── Critical Success Index (CSI) for presence/absence ────────────────────────
+# CSI = TP / (TP + FP + FN)  — ranges 0 to 1; 1 is perfect
+# Also called Threat Score. Penalises both false positives and false negatives.
+# Alternatives: F1 = 2TP/(2TP+FP+FN), MCC (Matthews Correlation Coefficient)
+csi_presence_absence <- function(sim_output, pa_obs, threshold = FLOW_THRESHOLD){
+  
+  TP <- 0L; FP <- 0L; FN <- 0L; TN <- 0L
+  
+  for(hid in unique(pa_obs$hru_id)){
+    
+    col_name <- paste0("q_sf_hru", hid)
+    if(!col_name %in% names(sim_output)) next
+    
+    sim_q   <- sim_output[, col_name]
+    sub_obs <- pa_obs[pa_obs$hru_id == hid, ]
+    sub_obs_xts <- xts(sub_obs$observed,
+                       order.by = as.POSIXct(sub_obs$datetime, tz = "UTC"))
+    
+    both    <- merge(sim_q, sub_obs_xts, join = "inner")
+    if(nrow(both) == 0) next
+    
+    sim_bin <- as.integer(as.numeric(both[, 1]) >= threshold)
+    obs_bin <- as.integer(as.numeric(both[, 2]))
+    valid   <- !is.na(sim_bin) & !is.na(obs_bin)
+    sim_bin <- sim_bin[valid]; obs_bin <- obs_bin[valid]
+    
+    TP <- TP + sum(sim_bin == 1L & obs_bin == 1L)
+    FP <- FP + sum(sim_bin == 1L & obs_bin == 0L)
+    FN <- FN + sum(sim_bin == 0L & obs_bin == 1L)
+    TN <- TN + sum(sim_bin == 0L & obs_bin == 0L)
+  }
+  
+  denom <- TP + FP + FN
+  if(denom == 0) return(NA_real_)
+  
+  list(
+    CSI      = TP / denom,
+    F1       = if((2*TP + FP + FN) > 0) 2*TP / (2*TP + FP + FN) else 0,
+    accuracy = (TP + TN) / (TP + FP + FN + TN),
+    TP = TP, FP = FP, FN = FN, TN = TN
+  )
+}
+
+# =============================================================================
+# 6. COMBINED OBJECTIVE FUNCTION
+# =============================================================================
+# Returns a single value to MINIMISE (so we negate KGE and CSI).
+# w_kge + w_csi should sum to 1. Adjust weights to reflect your priorities.
+
+W_KGE <- 1   # weight on discharge KGE
+W_CSI <- 0   # weight on presence/absence CSI
+
+PENALTY <- 100  # returned on model crash or non-finite result
+
+objective <- function(param_vec, mdl_template, obs, pa_obs,
+                      outlet_id = 1L, verbose = FALSE){
+  
+  params <- setNames(param_vec, param_bounds$name)
+  
+  sim <- run_model(params, mdl_template, obs, outlet_id,
+                   pa_hru_ids = unique(pa_obs$hru_id))
+  
+  # Guard: reject obviously unstable parameter combinations before running
+  if(params["s_rzmax"] < params["t_d"] / 1e8){  # t_d too large relative to rzmax
+    return(PENALTY)
+  }
+  
+  if(is.null(sim)) return(PENALTY)
+  
+  # Check for numerical blow-up in output
+  sim_vals <- as.numeric(sim)
+  if(any(!is.finite(sim_vals))) return(PENALTY)
+  if(any(abs(sim_vals) > 1e6))  return(PENALTY)  # catches blow-up that is still finite
+  
+  if(is.null(sim)){
+    if(verbose) cat("Model run failed — returning penalty\n")
+    return(PENALTY)
+  }
+  
+  # ── Discharge objective ────────────────────────────────────────────────────
+  sim_q   <- sim[, "q_out"]
+  kge_val <- kge(sim_q, obs_q)
+  if(!is.finite(kge_val)) return(PENALTY)
+  
+  # ── Presence/absence objective ─────────────────────────────────────────────
+  pa_scores <- csi_presence_absence(sim, pa_obs)
+  csi_val   <- if(!is.null(pa_scores) && is.finite(pa_scores$CSI)) pa_scores$CSI else 0
+  
+  # ── Combined (minimise negative weighted sum) ──────────────────────────────
+  combined <- -(W_KGE * kge_val + W_CSI * csi_val)
+  
+  if(verbose){
+    cat(sprintf("KGE=%.3f  CSI=%.3f  TP=%d FP=%d FN=%d  Combined=%.3f\n",
+                kge_val, csi_val,
+                pa_scores$TP, pa_scores$FP, pa_scores$FN,
+                -combined))
+  }
+  
+  return(combined)
+}
+
+# =============================================================================
+# GLUE — Generalized Likelihood Uncertainty Estimation
+# Replaces the run_lhs_calibration and DEoptim sections
+# =============================================================================
+
+# ── Likelihood functions ──────────────────────────────────────────────────────
+# GLUE typically uses informal likelihoods. We use KGE and CSI directly,
+# combined as a weighted product. Both range 0-1 so the product is also 0-1.
+# Runs below the behavioural threshold are rejected (likelihood = 0).
+
+KGE_THRESHOLD <- 0.3   # minimum acceptable KGE — adjust based on your results
+CSI_THRESHOLD <- 0.0   # minimum acceptable CSI — raise once model is working
+
+glue_likelihood <- function(kge_val, csi_val){
+  # Reject non-behavioural runs
+  if(!is.finite(kge_val) || kge_val < KGE_THRESHOLD) return(0)
+  if(!is.finite(csi_val) || csi_val < CSI_THRESHOLD) return(0)
+  
+  # Informal likelihood: weighted product
+  # Rescale KGE from [threshold, 1] to [0, 1] before combining
+  kge_scaled <- (kge_val - KGE_THRESHOLD) / (1 - KGE_THRESHOLD)
+  
+  L <- (kge_scaled ^ W_KGE) * (csi_val ^ W_CSI)
+  return(L)
+}
+
+# ── GLUE sampler ─────────────────────────────────────────────────────────────
+run_glue <- function(n_samples,
+                     mdl_template,
+                     obs,
+                     pa_obs,
+                     outlet_id   = 1L,
+                     n_cores     = 1L,
+                     seed        = 42L){
+  set.seed(seed)
+  
+  # LHS design scaled to parameter bounds (same as before)
+  lhs_design   <- randomLHS(n_samples, n_params)
+  param_matrix <- sweep(lhs_design, 2, param_bounds$upper - param_bounds$lower, "*")
+  param_matrix <- sweep(param_matrix, 2, param_bounds$lower, "+")
+  colnames(param_matrix) <- param_bounds$name
+  
+  cat(sprintf("Running %d GLUE samples...\n", n_samples))
+  
+  # ── Worker function — returns full scores not just combined ────────────────
+  glue_eval <- function(param_vec){
+    params <- setNames(param_vec, param_bounds$name)
+    
+    # Parameter guards, remove t_d one
+    
+    sim <- run_model(params, mdl_template, obs, outlet_id,
+                     pa_hru_ids = unique(pa_obs$hru_id))
+    
+    if(is.null(sim)) return(list(L=0, kge=NA, csi=NA))
+    
+    sim_vals <- as.numeric(sim)
+    if(any(!is.finite(sim_vals)) || any(abs(sim_vals) > 1e6)){
+      return(list(L=0, kge=NA, csi=NA))
+    }
+    
+    kge_val <- kge(sim[, "q_out"], obs_q)
+    pa_scores <- csi_presence_absence(sim, pa_obs)
+    csi_val <- if(!is.null(pa_scores)) pa_scores$CSI else 0
+    
+    L <- glue_likelihood(kge_val, csi_val)
+    
+    list(L = L, kge = kge_val, csi = csi_val)
+  }
+  
+  # ── Run in parallel or serial ──────────────────────────────────────────────
+  if(n_cores > 1L){
+    library(parallel)
+    cl <- makeCluster(n_cores)
+    clusterExport(cl,
+      c("mdl_template", "obs", "obs_q", "pa_obs", "param_bounds",
+        "FLOW_THRESHOLD", "W_KGE", "W_CSI", "KGE_THRESHOLD", "CSI_THRESHOLD",
+        "outlet_id", "run_model", "kge", "csi_presence_absence",
+        "glue_likelihood", "glue_eval"),
+      envir = environment())
+    clusterEvalQ(cl, { library(dynatop); library(xts) })
+    
+    score_list <- parApply(cl, param_matrix, 1, glue_eval)
+    stopCluster(cl)
+  } else {
+    score_list <- apply(param_matrix, 1, glue_eval)
+  }
+  
+  # ── Assemble results ───────────────────────────────────────────────────────
+  results <- data.frame(
+    param_matrix,
+    L   = sapply(score_list, `[[`, "L"),
+    kge = sapply(score_list, `[[`, "kge"),
+    csi = sapply(score_list, `[[`, "csi")
+  )
+  
+  n_behavioural <- sum(results$L > 0)
+  cat(sprintf("Behavioural runs: %d / %d (%.1f%%)\n",
+              n_behavioural, n_samples, 100 * n_behavioural / n_samples))
+  
+  if(n_behavioural == 0){
+    cat("No behavioural runs — lower KGE_THRESHOLD or check model setup.\n")
+  }
+  
+  # Normalise likelihoods to sum to 1 (for uncertainty bounds)
+  results$L_norm <- results$L / sum(results$L)
+  
+  return(results[order(-results$L), ])  # best likelihood first
+}
+
+# ── GLUE uncertainty bounds on discharge ──────────────────────────────────────
+glue_uncertainty_bounds <- function(glue_results, mdl_template, obs,
+                                    outlet_id = 0L,
+                                    quantiles = c(0.05, 0.95),
+                                    n_cores   = 1L){
+  
+  behav <- glue_results[glue_results$L > 0, ]
+  if(nrow(behav) == 0) stop("No behavioural runs to compute bounds from.")
+  cat(sprintf("Computing uncertainty bounds from %d behavioural runs...\n",
+              nrow(behav)))
+  
+  # Re-run each behavioural set and collect discharge series
+  get_sim_q <- function(i){
+    params <- as.numeric(behav[i, param_bounds$name])
+    names(params) <- param_bounds$name
+    sim <- run_model(params, mdl_template, obs, outlet_id)
+    if(is.null(sim)) return(NULL)
+    as.numeric(sim[, "q_out"])
+  }
+  
+  sim_matrix <- do.call(cbind, lapply(seq_len(nrow(behav)), get_sim_q))
+  
+  # Weighted quantiles using normalised likelihoods
+  L_w <- behav$L_norm / sum(behav$L_norm)  # re-normalise over behavioural only
+  
+  n_t <- nrow(sim_matrix)
+  bounds <- data.frame(
+    datetime = index(obs),
+    q_obs    = as.numeric(obs_q),
+    q_best   = sim_matrix[, 1],  # highest likelihood run
+    q_mean   = apply(sim_matrix, 1, weighted.mean, w = L_w)
+  )
+  for(q in quantiles){
+    col_name <- paste0("q_", gsub("\\.", "", sprintf("%.0f", q * 100)))
+    bounds[[col_name]] <- apply(sim_matrix, 1, function(row){
+      # Weighted quantile
+      ord <- order(row)
+      cumw <- cumsum(L_w[ord])
+      row[ord][which(cumw >= q)[1]]
+    })
+  }
+  return(bounds)
+}
+
+# ── Plot GLUE uncertainty bands ───────────────────────────────────────────────
+plot_glue_bounds <- function(bounds){
+  bounds_xts <- xts(bounds[, -1], order.by = bounds$datetime)
+  
+  plot(bounds_xts[, "q_obs"], col = "black", lwd = 1.5,
+       main = "GLUE uncertainty bounds vs observed discharge [m³/s]",
+       ylab = "m³/s")
+  
+  # Shade uncertainty band
+  t_idx <- bounds$datetime
+  polygon(c(t_idx, rev(t_idx)),
+          c(bounds$q_05, rev(bounds$q_95)),
+          col = adjustcolor("steelblue", alpha.f = 0.3), border = NA)
+  
+  lines(t_idx, bounds$q_best, col = "firebrick", lwd = 1.5)
+  lines(t_idx, bounds$q_mean, col = "steelblue", lwd = 1, lty = 2)
+  
+  legend("topright",
+         legend = c("Observed", "Best likelihood", "Weighted mean", "5–95% band"),
+         col    = c("black", "firebrick", "steelblue", 
+                    adjustcolor("steelblue", 0.3)),
+         lwd    = c(1.5, 1.5, 1, 8),
+         lty    = c(1, 1, 2, 1))
+}
+
+# ── Dotty plots: likelihood vs each parameter ─────────────────────────────────
+plot_glue_dotty <- function(glue_results){
+  behav    <- glue_results[glue_results$L > 0, ]
+  nonbehav <- glue_results[glue_results$L == 0, ]
+  
+  par(mfrow = c(3, 3))
+  for(pn in param_bounds$name){
+    plot(nonbehav[[pn]], nonbehav$L,
+         xlab = pn, ylab = "Likelihood",
+         pch = 16, cex = 0.4, col = "grey70",
+         ylim = c(0, max(glue_results$L, na.rm = TRUE)),
+         xlim = range(param_bounds[param_bounds$name == pn, c("lower","upper")]))
+    points(behav[[pn]], behav$L,
+           pch = 16, cex = 0.6, col = "firebrick")
+    abline(h = 0, lty = 2, col = "grey50")
+  }
+  par(mfrow = c(1,1))
+}
+
+# =============================================================================
+# RUN GLUE
+# =============================================================================
+Sys.time()
+glue_results <- run_glue(
+  n_samples    = 1,        # GLUE needs more samples than optimisation
+  mdl_template = mdl,
+  obs          = obs_cal,
+  pa_obs       = pa_obs,
+  outlet_id    = 0L,
+  n_cores      = 7L,
+  seed         = 42L
+)
+Sys.time()
+saveRDS(glue_results, "glue_results_0l.rds")
+
+# Inspect results
+cat("\nTop 10 behavioural runs:\n")
+print(head(glue_results[glue_results$L > 0, 
+           c(param_bounds$name, "L", "kge", "csi")], 10))
+
+# Dotty plots
+plot_glue_dotty(glue_results)
+
+# Uncertainty bounds (re-runs behavioural sets — can be slow)
+bounds <- glue_uncertainty_bounds(glue_results, mdl, obs_cal[,-1],
+                                  outlet_id = OUTLET_ID)
+plot_glue_bounds(bounds)
+
+# =============================================================================
+# 8. RUN CALIBRATION (choose one or both)
+# =============================================================================
+
+# ── Confirm outlet HRU id ─────────────────────────────────────────────────────
+for(ii in seq_along(mdl$hru)){
+  h <- mdl$hru[[ii]]
+  if(length(h$sf_flow_direction$id) == 0 & length(h$sz_flow_direction$id) == 0){
+    cat("Outlet HRU id:", h$id, "| is channel:", !is.na(h$class$endNode), "\n")
+  }
+}
+OUTLET_ID <- 0L   # ← set from the output above
+
+# ── Quick single-run test before launching calibration ───────────────────────
+test_params <- setNames(
+  (param_bounds$lower + param_bounds$upper) / 2,   # midpoint of each range
+  param_bounds$name
+)
+cat("Testing single run with midpoint parameters...\n")
+test_score <- objective(test_params, mdl, obs[,-1], pa_obs,
+                        outlet_id = OUTLET_ID, verbose = TRUE)
+cat("Test score:", test_score, "\n")
+# If this returns PENALTY (100), check run_model() output manually
+
+cal_start <- as.POSIXct("2023-05-15", tz = "UTC")
+cal_start <- min(index(obs_cal))
+cal_end <- max(index(obs_cal))
+
+
+cal_end   <- as.POSIXct("2024-08-31", tz = "UTC")
+obs_cal   <- obs[index(obs) >= cal_start & index(obs) <= cal_end, ]
+
+# Also subset pa_obs to the same period
+pa_obs_cal <- pa_obs[pa_obs$datetime >= cal_start & 
+                     pa_obs$datetime <= cal_end, ]
+
+
+# =============================================================================
+# 9. EVALUATE AND PLOT BEST PARAMETER SET
+# =============================================================================
+
+best_params <- as.numeric(glue_results[1, param_bounds$name])
+names(best_params) <- param_bounds$name
+
+# Re-run with verbose output to see score breakdown
+cat("\nFinal evaluation of best parameters:\n")
+objective(best_params, mdl, obs_cal, pa_obs,
+          outlet_id = OUTLET_ID, verbose = TRUE)
+
+# Get full simulation output for plotting
+best_sim <- run_model(best_params, mdl, obs_cal,
+                      outlet_id  = OUTLET_ID,
+                      pa_hru_ids = unique(pa_obs$hru_id))
+
+# ── Plot discharge ─────────────────────────────────────────────────────────────
+plot(merge(best_sim[, "q_out"], obs_cal[,2]),
+     main = "Observed vs Simulated discharge [m³/s]",
+     legend.loc = "topright",
+     col = c("firebrick", "black"))
+
+
+# ── Plot presence/absence performance at each site ────────────────────────────
+#for(hid in unique(pa_obs$hru_id)){
+  hid <- 37
+  col_name <- paste0("q_sf_hru", hid)
+  if(!col_name %in% names(best_sim)) next
+  
+  sim_q <- best_sim[, col_name]
+  sub   <- pa_obs[pa_obs$hru_id == hid, ]
+  
+  # Convert to binary
+  sim_bin <- as.integer(as.numeric(sim_q) >= FLOW_THRESHOLD)
+  
+  plot(sim_q, main = paste("HRU", hid, "— simulated q_sf"),
+       ylab = "m³/s", col = "steelblue")
+  abline(h = FLOW_THRESHOLD, lty = 2, col = "grey50")
+  
+  # Shade observed flowing periods
+  flowing_periods <- sub[sub$observed == 1, ]
+  #if(nrow(flowing_periods) > 0){
+    # Group into contiguous blocks
+    times <- sort(unique(as.POSIXct(flowing_periods$datetime)))
+    rect(xleft  = head(times, -1),
+         xright = tail(times, -1),
+         ybottom = 0, ytop = par("usr")[4],
+         col = adjustcolor("green", alpha.f = 0.15), border = NA)
+  }
+  legend("topright", legend = c("Simulated", "Flow threshold", "Observed flowing"),
+         col = c("steelblue", "grey50", adjustcolor("green", 0.4)),
+         lty = c(1, 2, NA), pch = c(NA, NA, 15))
+}
+
+# ── Dotty plots: parameter sensitivity from LHS ───────────────────────────────
+# Shows which parameters are most constrained by the data
+par(mfrow = c(3, 3))
+for(pn in param_bounds$name){
+  plot(lhs_results[[pn]], -lhs_results$score,
+       xlab = pn, ylab = "KGE+CSI combined",
+       ylim= c(-1,1),
+       pch = 16, cex = 0.5,
+       col = ifelse(-lhs_results$score > quantile(-lhs_results$score, 0.9),
+                    "firebrick", "grey60"))
+  abline(v = best_params[pn], col = "black", lty = 2)
+}
+par(mfrow = c(1, 1))
+
+# =============================================================================
+# 10. SNOW PARAMETER NOTES
+# =============================================================================
+# The three snow parameters interact:
+#   t_tt   — separates rain from snow events; affects WHICH timesteps accumulate
+#   t_cfmax — controls melt RATE; very sensitive in spring
+#   t_sfcf  — corrects for wind undercatch of snowfall; effectively a precip
+#              multiplier for cold periods; try 0.6-1.2 for most gauges
+#
+# If your model has SWE observations, you can add a third objective:
+#   swe_rmse <- function(sim_swe, obs_swe){ sqrt(mean((sim_swe - obs_swe)^2)) }
+# and add W_SWE * (1 - swe_rmse/max_swe) to the combined objective.
+#
+# Snow parameters are most identifiable in years with clear accumulation +
+# melt seasons — consider calibrating only on those years first, then
+# fixing snow params and calibrating hydrology on the full record.
+```
+
+
+```{r diagnosing param}
+for(hid in unique(pa_obs$hru_id)){
+  idx <- which(sapply(mdl$hru, function(h) h$id == hid))
+  is_ch <- !is.na(mdl$hru[[idx]]$class$endNode)
+  # Find nearest downstream channel if hillslope
+  sf_down <- mdl$hru[[idx]]$sf_flow_direction$id
+  cat("HRU", hid, "| is channel:", is_ch, 
+      "| sf flows to:", sf_down, "\n")
+}
+
+# Build a lookup: hillslope id → nearest downstream channel id
+hs_to_channel <- function(hid, hru_list){
+  idx <- which(sapply(hru_list, function(h) h$id == hid))
+  h   <- hru_list[[idx]]
+  if(!is.na(h$class$endNode)) return(hid)  # already a channel
+  # Follow sf_flow_direction until we hit a channel
+  next_id <- h$sf_flow_direction$id
+  if(length(next_id) == 0) return(NA_integer_)
+  hs_to_channel(next_id[1], hru_list)  # recurse
+}
+
+# Remap pa_obs hru_ids to nearest downstream channel
+pa_obs$hru_id_orig    <- pa_obs$hru_id
+pa_obs$hru_id_channel <- sapply(pa_obs$hru_id, hs_to_channel, hru_list = mdl$hru)
+
+cat("HRU remapping:\n")
+print(unique(pa_obs[, c("hru_id_orig", "hru_id_channel")]))
+
+# Apply the remapping
+pa_obs$hru_id <- pa_obs$hru_id_channel
+
+## second thing
+for(ii in seq_along(mdl$hru)){
+  if(!is.na(mdl$hru[[ii]]$class$endNode)){
+    cat("HRU", mdl$hru[[ii]]$id, 
+        "| sf type:", mdl$hru[[ii]]$sf$type,
+        "| parameters:", mdl$hru[[ii]]$sf$parameters, "\n")
+  }
+}
+
+# Run with very conservative parameters to isolate where the blow-up starts
+safe_params <- setNames(param_bounds$lower, param_bounds$name)
+safe_params["t_d"]   <- 28800   # 8 hours
+safe_params["n_ch"]  <- 0.05
+safe_params["t_raf"] <- 900
+
+safe_sim <- run_model(safe_params, mdl, obs_cal, outlet_id = OUTLET_ID)
+if(!is.null(safe_sim)){
+  cat("Safe run q_out range:", range(as.numeric(safe_sim[,"q_out"])), "\n")
+} else {
+  cat("Safe run returned NULL\n")
+}
+
+#
+# Step 1: expose the actual error in serial
+test_params <- setNames(param_bounds$lower, param_bounds$name)
+test_params["t_d"] <- 7200  # keep above guard
+
+# Temporarily bypass tryCatch in run_model by calling internals directly
+hru <- mdl$hru
+obs_input <- strip_obs(obs_cal)
+total_area <- sum(sapply(hru, function(h) h$properties["area"]))
+q_init <- as.numeric(na.omit(obs_cal$Discharge_m3_s))[1]
+
+# Walk through the parameter-setting loop and find where it breaks
+for(ii in seq_along(hru)){
+  cat("Setting HRU", hru[[ii]]$id, "...\n")
+  is_channel <- !is.na(hru[[ii]]$class$endNode)
+  cat("  is_channel:", is_channel, "\n")
+  
+  if(!is_channel){
+    hru[[ii]]$sz$parameters["t_0"]     <- test_params["t_0"]
+    hru[[ii]]$sz$parameters["m"]       <- test_params["m"]
+    hru[[ii]]$uz$parameters["t_d"]     <- test_params["t_d"]
+    hru[[ii]]$rz$parameters["s_rzmax"] <- test_params["s_rzmax"]
+    if(hru[[ii]]$sf$type == "cnst")
+      hru[[ii]]$sf$parameters["c_sf"]  <- test_params["c_sf"]
+  } else {
+    hru[[ii]]$sz$parameters["t_0"]     <- 0.001
+    hru[[ii]]$rz$parameters["s_rzmax"] <- 0.001
+    if(hru[[ii]]$sf$type == "cnst")
+      hru[[ii]]$sf$parameters["c_sf"]  <- test_params["v_ch"]
+  }
+  
+  # Snow — this is the most likely failure point
+  cat("  snow structure:", names(hru[[ii]]$snow), "\n")
+  cat("  snow parameters:", names(hru[[ii]]$snow$parameters), "\n")
+  hru[[ii]]$snow$parameters["T_T"]  <- test_params["T_T"]
+  hru[[ii]]$snow$parameters["C_f"]  <- test_params["C_f"]
+  hru[[ii]]$snow$parameters["C_wh"] <- test_params["C_wh"]
+  
+  hru[[ii]]$initialisation["s_rz_0"]    <- 0.3
+  hru[[ii]]$initialisation["r_uz_sz_0"] <- q_init / total_area
+}
+cat("Parameter loop completed successfully\n")
+
+# Test a single worker directly with a known-good parameter set
+cl <- makeCluster(1L)
+
+clusterExport(cl,
+  c("mdl_template", "obs", "obs_q", "pa_obs",
+    "param_bounds", "n_params",
+    "FLOW_THRESHOLD", "W_KGE", "W_CSI",
+    "KGE_THRESHOLD", "CSI_THRESHOLD",
+    "outlet_id",
+    "run_model", "strip_obs",
+    "kge", "csi_presence_absence",
+    "glue_likelihood", "glue_eval"),
+  envir = environment())
+clusterEvalQ(cl, { library(dynatop); library(xts) })
+
+# Run one evaluation on the worker with full error detail
+test_vec <- (param_bounds$lower + param_bounds$upper) / 2
+test_vec[param_bounds$name == "t_d"] <- 7200
+
+result <- clusterCall(cl, function(pv){
+  tryCatch({
+    glue_eval(pv)
+  }, error = function(e){
+    # Return the full error message AND the call stack
+    list(error = conditionMessage(e),
+         call  = paste(deparse(conditionCall(e)), collapse=" "))
+  })
+}, pv = test_vec)
+
+stopCluster(cl)
+cat("Worker result:\n")
+print(result[[1]])
+
+# Stop any existing cluster first
+if(exists("cl")) try(stopCluster(cl), silent=TRUE)
+
+cl <- makeCluster(1L)
+clusterEvalQ(cl, { library(dynatop); library(xts) })
+clusterExport(cl,
+  c("mdl_template", "obs", "obs_q", "pa_obs",
+    "param_bounds", "n_params",
+    "FLOW_THRESHOLD", "W_KGE", "W_CSI",
+    "KGE_THRESHOLD", "CSI_THRESHOLD",
+    "outlet_id",
+    "run_model", "strip_obs",
+    "kge", "csi_presence_absence",
+    "glue_likelihood", "glue_eval"),
+  envir = .GlobalEnv)
+
+# Send one parameter vector and catch everything
+test_vec <- (param_bounds$lower + param_bounds$upper) / 2
+test_vec[param_bounds$name == "t_d"] <- 7200
+
+result <- parLapply(cl, list(test_vec), function(pv){
+  tryCatch(
+    withCallingHandlers(
+      glue_eval(pv),
+      error   = function(e) cat("ERROR:", conditionMessage(e), "\n"),
+      warning = function(w) cat("WARN:", conditionMessage(w), "\n")
+    ),
+    error = function(e){
+      # Capture full traceback
+      list(
+        error = conditionMessage(e),
+        trace = paste(capture.output(traceback()), collapse="\n")
+      )
+    }
+  )
+})
+
+stopCluster(cl)
+print(result[[1]])
+
+required_exports <- c("mdl_template", "obs", "obs_q", "pa_obs",
+                       "param_bounds", "n_params",
+                       "FLOW_THRESHOLD", "W_KGE", "W_CSI",
+                       "KGE_THRESHOLD", "CSI_THRESHOLD",
+                       "outlet_id", "run_model", "strip_obs",
+                       "kge", "csi_presence_absence",
+                       "glue_likelihood", "glue_eval")
+
+for(nm in required_exports){
+  exists_global <- exists(nm, envir = .GlobalEnv, inherits = FALSE)
+  cat(nm, ":", ifelse(exists_global, "OK", "MISSING"), "\n")
+}
+
+cl <- makeCluster(1L)
+clusterEvalQ(cl, { library(dynatop); library(xts) })
+clusterExport(cl, c("mdl_template", "param_bounds", "run_model", 
+                    "strip_obs", "obs_cal", "outlet_id"),
+              envir = .GlobalEnv)
+
+result <- parLapply(cl, list(1), function(dummy){
+  # Try just dynatop$new() in isolation
+  hru <- mdl_template$hru
+  tryCatch(
+    dynatop$new(hru, map = mdl_template$map),
+    error = function(e) list(error = conditionMessage(e))
+  )
+})
+stopCluster(cl)
+cat("dynatop$new() on worker:", result[[1]]$error, "\n")
+
+######
+cl <- makeCluster(1L)
+clusterEvalQ(cl, { library(dynatop); library(xts) })
+clusterExport(cl, c("mdl_template", "param_bounds", "strip_obs", 
+                    "obs_cal", "outlet_id", "pa_obs",
+                    "FLOW_THRESHOLD", "obs_q"),
+              envir = .GlobalEnv)
+
+result <- parLapply(cl, list(1), function(dummy){
+  hru       <- mdl_template$hru
+  obs_input <- strip_obs(obs_cal)
+  
+  # Step 1
+  cm <- tryCatch(dynatop$new(hru, map = mdl_template$map),
+                 error = function(e) return(list(failed_at="new", error=conditionMessage(e))))
+  if(is.list(cm) && !is.null(cm$failed_at)) return(cm)
+  cat("new: OK\n")
+  
+  # Step 2
+  tryCatch(cm$add_data(obs_input),
+           error = function(e) return(list(failed_at="add_data", error=conditionMessage(e))))
+  cat("add_data: OK\n")
+  
+  # Step 3
+  tryCatch(cm$initialise(),
+           error = function(e) return(list(failed_at="initialise", error=conditionMessage(e))))
+  cat("initialise: OK\n")
+  
+  # Step 4
+  out_rows <- data.frame(name="q_out", id=outlet_id, flux="q_sf",
+                         scale=1.0, stringsAsFactors=FALSE)
+  tryCatch(cm$sim(out_rows, sub_step=900)$get_output(),
+           error = function(e) return(list(failed_at="sim", error=conditionMessage(e))))
+})
+
+stopCluster(cl)
+print(result[[1]])
+######
+# Print the actual source of run_model as the worker sees it
+cl <- makeCluster(1L)
+clusterEvalQ(cl, { library(dynatop); library(xts) })
+clusterExport(cl, c("run_model", "strip_obs", "mdl_template"),
+              envir = .GlobalEnv)
+
+result <- parLapply(cl, list(1), function(dummy){
+  # Find the is_channel line in run_model
+  src <- deparse(body(run_model))
+  src[grep("is_channel", src)]
+})
+stopCluster(cl)
+print(result[[1]])
+
+# Confirm the global run_model has the fix
+src <- deparse(body(run_model))
+cat(src[grep("is_channel", src)], sep="\n")
+
+# Temporarily replace glue_eval with a diagnostic version
+glue_eval_debug <- function(param_vec){
+  params <- setNames(param_vec, param_bounds$name)
+  
+  cat("Step 1: guards\n")
+  if(params["t_d"]    < 900)  return(list(L=0, kge=NA, csi=NA))
+  if(params["s_rzmax"] <= 0)  return(list(L=0, kge=NA, csi=NA))
+  
+  cat("Step 2: run_model\n")
+  sim <- tryCatch(
+    run_model(params, mdl_template, obs, outlet_id,
+              pa_hru_ids = unique(pa_obs$hru_id)),
+    error   = function(e) list(failed_at="run_model", error=conditionMessage(e)),
+    warning = function(w) list(failed_at="run_model_warn", error=conditionMessage(w))
+  )
+  if(is.list(sim) && !is.null(sim$failed_at)) return(sim)
+  cat("run_model: OK, sim is", class(sim), "\n")
+  
+  if(is.null(sim)) return(list(L=0, kge=NA, csi=NA))
+  
+  cat("Step 3: blow-up check\n")
+  sim_vals <- as.numeric(sim)
+  if(any(!is.finite(sim_vals)) || any(abs(sim_vals) > 1e3))
+    return(list(L=0, kge=NA, csi=NA))
+  
+  cat("Step 4: kge\n")
+  kge_val <- tryCatch(
+    kge(sim[, "q_out"], obs_q),
+    error = function(e) list(failed_at="kge", error=conditionMessage(e))
+  )
+  if(is.list(kge_val)) return(kge_val)
+  cat("kge:", kge_val, "\n")
+  
+  cat("Step 5: csi\n")
+  pa_scores <- tryCatch(
+    csi_presence_absence(sim, pa_obs),
+    error = function(e) list(failed_at="csi", error=conditionMessage(e))
+  )
+  if(is.list(pa_scores) && !is.null(pa_scores$failed_at)) return(pa_scores)
+  csi_val <- if(!is.null(pa_scores) && is.finite(pa_scores$CSI)) pa_scores$CSI else 0
+  cat("csi:", csi_val, "\n")
+  
+  cat("Step 6: likelihood\n")
+  L <- glue_likelihood(kge_val, csi_val)
+  cat("L:", L, "\n")
+  
+  list(L = L, kge = kge_val, csi = csi_val)
+}
+
+# Run debug version on a single worker
+cl <- makeCluster(1L)
+clusterEvalQ(cl, { library(dynatop); library(xts) })
+clusterExport(cl,
+  c("mdl_template", "obs", "obs_q", "pa_obs",
+    "param_bounds", "n_params",
+    "FLOW_THRESHOLD", "W_KGE", "W_CSI",
+    "KGE_THRESHOLD", "CSI_THRESHOLD",
+    "outlet_id", "run_model", "strip_obs",
+    "kge", "csi_presence_absence",
+    "glue_likelihood", "glue_eval_debug"),
+  envir = .GlobalEnv)
+
+test_vec <- (param_bounds$lower + param_bounds$upper) / 2
+test_vec[param_bounds$name == "t_d"] <- 7200
+
+result <- parLapply(cl, list(test_vec), function(pv){
+  glue_eval_debug(pv)
+})
+stopCluster(cl)
+print(result[[1]])
+
+cl <- makeCluster(1L)
+clusterEvalQ(cl, { library(dynatop); library(xts) })
+clusterExport(cl, c("param_bounds", "n_params"), envir = .GlobalEnv)
+
+test_vec <- (param_bounds$lower + param_bounds$upper) / 2
+test_vec[param_bounds$name == "t_d"] <- 7200
+
+result <- parLapply(cl, list(test_vec), function(pv){
+  params <- setNames(pv, param_bounds$name)
+  list(
+    params    = params,
+    t_d_val   = params["t_d"],
+    t_d_check = params["t_d"] < 900,
+    s_rz_val  = params["s_rzmax"],
+    s_rz_check = params["s_rzmax"] <= 0,
+    names_match = all(param_bounds$name %in% names(params))
+  )
+})
+stopCluster(cl)
+print(result[[1]])
+```
+
+```{r hopefully better param}
+# =============================================================================
+# dynatop GLUE Calibration — fully corrected version
+# Objectives: (1) Discharge KGE via q_sf at outlet HRU 0
+#             (2) Flow presence/absence CSI at channel observation points
+# =============================================================================
+
+#library(dynatop)
+
+
+# =============================================================================
+# 1. LOAD MODEL AND DATA
+# =============================================================================
+
+#mdl <- readRDS(file.path(".", "hb_data", "dynaGIS", "atb_20.rds"))
+#obs <- readRDS(file.path(".", "processed", "obs.rds"))
+# obs columns: Discharge_ls, Discharge_m3_s, precip (m/step), pet (m/step), temp (°C)
+# precip and pet must already be in m/step, not mm
+
+# ── Calibration window ────────────────────────────────────────────────────────
+cal_start <- as.POSIXct("2023-05-15", tz = "UTC")
+cal_end   <- as.POSIXct("2024-05-31", tz = "UTC")
+obs_cal   <- obs[index(obs) >= cal_start & index(obs) <= cal_end, ]
+
+# ── Observed discharge for KGE — subset to calibration window ─────────────────
+obs_q <- obs_cal$Discharge_m3_s
+
+# ── Confirm outlet HRU ────────────────────────────────────────────────────────
+for(ii in seq_along(mdl$hru)){
+  h <- mdl$hru[[ii]]
+  if(length(h$sf_flow_direction$id) == 0 & length(h$sz_flow_direction$id) == 0)
+    cat("Outlet HRU id:", h$id, "| is channel:", !is.na(h$class$endNode), "\n")
+}
+OUTLET_ID <- 0L  # confirm from output above
+
+# =============================================================================
+# 2. FLOW PRESENCE/ABSENCE OBSERVATIONS
+# =============================================================================
+
+all_24 <- read_csv("/Users/johnmorgan/Documents/VT Research/HBTopModel/STIC_Synthesis/all_24.csv")
+
+# Snap STIC locations to nearest channel HRU within 30 m
+stic_locs <- all_24 %>%
+  filter(wshed == "W3") %>%
+  select(number, lat, long) %>%
+  unique() %>%
+  vect(geom = c("long", "lat"), crs = "EPSG:4326") %>%
+  project("EPSG:26919")
+
+all_out <- do.call(rbind, lapply(seq_len(nrow(stic_locs)), function(i){
+  dist_table <- distance(stic_locs[i,], result$conv_channel)
+  idx        <- which(dist_table == min(dist_table))[1]
+  data.frame(ID         = stic_locs[i,]$number,
+             channel_ID = result$conv_channel[idx,]$name,
+             dist       = min(dist_table))
+}))
+
+chosen <- all_out %>% filter(dist <= 30)
+
+pa_obs <- all_24 %>%
+  filter(wshed == "W3", number %in% chosen$ID) %>%
+  select(datetime, number, wetdry) %>%
+  rename(ID = number) %>%
+  left_join(chosen, by = "ID", multiple = "first") %>%
+  mutate(
+    observed = as.integer(case_when(wetdry == "wet" ~ 1, wetdry == "dry" ~ 0)),
+    hru_id   = as.integer(channel_ID),
+    datetime = as.POSIXct(datetime, tz = "UTC")
+  ) %>%
+  select(hru_id, datetime, observed) %>%
+  filter(datetime >= cal_start, datetime <= cal_end) %>%
+  filter(!is.na(hru_id), !is.na(observed))
+
+cat("PA observation sites (HRU ids):", unique(pa_obs$hru_id), "\n")
+cat("PA observations:", nrow(pa_obs),
+    "| flowing:", sum(pa_obs$observed == 1),
+    "| dry:", sum(pa_obs$observed == 0), "\n")
+
+# Flow threshold: simulated q_sf (m³/s) above which channel is "flowing".
+# Set to a small fraction of typical baseflow. Adjust based on diagnostic below.
+FLOW_THRESHOLD <- 1e-8
+
+# =============================================================================
+# 3. PARAMETER SPACE
+# =============================================================================
+
+param_bounds <- data.frame(
+  name  = c("t_0",     # saturated zone transmissivity at saturation (m²/s)
+             "m",       # exponential decay constant (m⁻¹)
+             "t_d",     # unsaturated zone time delay (s) — must be >> timestep (900s)
+             "s_rzmax", # root zone max storage (m)
+             "c_sf",    # hillslope surface velocity (m/s)
+             "n_ch",    # (Manning's n for natural channels)
+             "v_ch", # velocity of the channel, in mdl c_sf, but in channel HRUs
+             "T_T",     # snow/rain temperature threshold (°C)
+             "C_f",     # degree-day melt factor (m/°C/day)
+             "C_wh"),   # snowfall correction factor (-)
+  lower = c(0.001,  0.005,  7200,   0.05,  0.1,  0.02,  0.3,
+            0.0,  0.001,  0.5),
+  upper = c(5.0,    0.08,   172800, 0.5,   1.0,  0.15,  0.3,
+            2.0,  0.008,  1.5),
+  stringsAsFactors = FALSE
+)
+n_params <- nrow(param_bounds)
+
+# =============================================================================
+# 4. MODEL RUNNER
+# =============================================================================
+# KEY FIXES vs previous version:
+#   - Output flux is q_sf at OUTLET_ID (not v_sf_rz, which is infiltration flux)
+#   - Discharge column is stripped from obs inside this function — always consistent
+#   - baseflow derived from calibration period start, not full obs start
+#   - s_rz_0 starts at 0.3 (drier) to avoid immediate surface runoff spike
+#   - Channel c_sf is printed to catch cases where sf type is not "cnst"
+
+# Helper: strip non-forcing columns before passing to dynatop
+strip_obs <- function(obs_xts){
+  drop <- c("Discharge_m3_s", "Discharge_ls", "Discharge")
+  keep <- !names(obs_xts) %in% drop
+  obs_xts[, keep]
+}
+
+run_model <- function(params,
+                      mdl_template,
+                      obs,
+                      outlet_id  = 0L,
+                      pa_hru_ids = unique(pa_obs$hru_id),
+                      sub_step   = 900){
+
+  hru        <- mdl_template$hru
+  obs_input  <- strip_obs(obs)  # remove discharge — dynatop only wants forcings
+  total_area <- sum(sapply(hru, function(h) h$properties["area"]))
+
+  # Baseflow for initialisation: use first valid value in obs window
+  q_init   <- as.numeric(na.omit(obs$Discharge_m3_s))[1]
+  if(!is.finite(q_init) || q_init <= 0) q_init <- 1e-5
+
+  for(ii in seq_along(hru)){
+    #is_channel <- !is.na(hru[[ii]]$class$endNode)
+    is_channel <- isTRUE(!is.na(hru[[ii]]$class$endNode))
+
+
+    if(!is_channel){
+      # ── Hillslope ────────────────────────────────────────────────────────
+      hru[[ii]]$sz$parameters["t_0"]     <- params["t_0"]
+      hru[[ii]]$sz$parameters["m"]       <- params["m"]
+      hru[[ii]]$uz$parameters["t_d"]     <- params["t_d"]
+      hru[[ii]]$rz$parameters["s_rzmax"] <- params["s_rzmax"]
+
+      if(hru[[ii]]$sf$type == "cnst"){
+        hru[[ii]]$sf$parameters["c_sf"]  <- params["c_sf"]
+      }
+      # kin type: leave Manning n at its dynatopGIS-derived value
+      # (add "n" to param_bounds if you want to calibrate it)
+
+    } else {
+      # ── Channel ──────────────────────────────────────────────────────────
+      # Keep channel subsurface transmissivity very low — channels don't
+      # have meaningful lateral subsurface flow in this implementation
+      hru[[ii]]$sz$parameters["t_0"]     <- 0.001
+      hru[[ii]]$rz$parameters["s_rzmax"] <- 0.001
+
+      if(hru[[ii]]$sf$type == "cnst"){
+        hru[[ii]]$sf$parameters["c_sf"]  <- params["v_ch"]
+      } else if(hru[[ii]]$sf$type == "kin"){
+        # For kinematic wave channels, velocity is derived from Manning n
+        # and slope — leave as-is, or add n_ch to param_bounds
+        hru[[ii]]$sf$parameters["n"]     <- params["n_ch"]  # Manning's n
+        hru[[ii]]$sf$parameters["t_raf"] <- 0               # no detention
+        hru[[ii]]$sf$parameters["s_raf"] <- 0
+      }
+    }
+
+    # ── Snow parameters ───────────────────────────────────────────────────
+    # Adapt these names to match your C++ implementation's parameter names
+    hru[[ii]]$snow$parameters["T_T"]  <- params["T_T"]
+    hru[[ii]]$snow$parameters["C_f"]  <- params["C_f"]
+    hru[[ii]]$snow$parameters["C_wh"] <- params["C_wh"]
+
+    # ── Initial conditions ────────────────────────────────────────────────
+    # s_rz_0 = 0.3: start relatively dry to avoid an initial surface runoff
+    # spike. Raise toward 0.6-0.8 for wet season starts.
+    hru[[ii]]$initialisation["s_rz_0"]    <- 0.3
+    hru[[ii]]$initialisation["r_uz_sz_0"] <- q_init / total_area
+  }
+
+  # ── Output definition ─────────────────────────────────────────────────────
+  # q_sf at the outlet is the catchment discharge in m³/s.
+  # v_sf_rz is infiltration flux INTO the root zone — NOT discharge.
+  pa_ids  <- unique(pa_hru_ids)
+  out_rows <- rbind(
+    data.frame(name  = "q_out",
+               id    = outlet_id,
+               flux  = "q_sf",    # ← CORRECT: surface outflow at outlet
+               scale = 1.0,
+               stringsAsFactors = FALSE),
+    data.frame(name  = paste0("q_sf_hru", pa_ids),
+               id    = pa_ids,
+               flux  = "q_sf",
+               scale = 1.0,
+               stringsAsFactors = FALSE)
+  )
+
+  result <- tryCatch({
+    cm <- dynatop$new(hru, map = mdl_template$map)
+    cm$add_data(obs_input)
+    cm$initialise()
+    cm$sim(out_rows, sub_step = sub_step)$get_output()
+  }, error = function(e){
+    NULL
+  })
+
+  return(result)
+}
+
+# =============================================================================
+# 5. DIAGNOSTIC — run before calibration to confirm model is working
+# =============================================================================
+# Checks:
+#   (a) q_sf at outlet tracks observed discharge with correct order of magnitude
+#   (b) s_sf at outlet does NOT grow unboundedly through time
+#   (c) Simulated q_sf at PA sites is non-zero during observed flowing periods
+
+run_diagnostic <- function(mdl, obs_cal, pa_obs,
+                           outlet_id = 0L, sub_step = 900){
+
+  obs_input <- strip_obs(obs_cal)
+
+  diag_rows <- data.frame(
+    name  = c("q_sf_out", "s_sf_out", "s_sz_out", "q_sz_out"),
+    id    = c(outlet_id, outlet_id, outlet_id, outlet_id),
+    flux  = c("q_sf", "s_sf", "s_sz", "q_sz"),
+    scale = c(1.0, 1.0, 1.0, 1.0),
+    stringsAsFactors = FALSE
+  )
+
+  cm <- dynatop$new(mdl$hru, map = mdl$map)
+  cm$add_data(obs_input)
+  cm$initialise()
+  diag_out <- cm$sim(diag_rows, sub_step = sub_step)$get_output()
+
+  cat("=== Outlet diagnostics ===\n")
+  cat("q_sf range (m³/s):", range(as.numeric(diag_out[,"q_sf_out"])), "\n")
+  cat("s_sf range (m³):  ", range(as.numeric(diag_out[,"s_sf_out"])), "\n")
+  cat("q_sz range (m³/s):", range(as.numeric(diag_out[,"q_sz_out"])), "\n")
+  cat("obs_q range (m³/s):", range(as.numeric(obs_q), na.rm=TRUE), "\n")
+
+  # s_sf should NOT grow monotonically — check slope
+  s_sf_vals <- as.numeric(diag_out[,"s_sf_out"])
+  if(s_sf_vals[length(s_sf_vals)] > 10 * s_sf_vals[1] + 1){
+    cat("WARNING: s_sf is growing unboundedly — channel surface is not draining.\n")
+    cat("  Check that channel HRU sf type is 'cnst' and v_ch > 0.\n")
+    cat("  Channel HRU sf types:\n")
+    for(ii in seq_along(mdl$hru)){
+      if(!is.na(mdl$hru[[ii]]$class$endNode))
+        cat("    HRU", mdl$hru[[ii]]$id, "sf type:", mdl$hru[[ii]]$sf$type,
+            "| c_sf:", mdl$hru[[ii]]$sf$parameters, "\n")
+    }
+  } else {
+    cat("s_sf appears stable — channel is draining correctly.\n")
+  }
+
+  # PA site check
+  pa_rows <- data.frame(
+    name  = paste0("q_sf_hru", unique(pa_obs$hru_id)),
+    id    = unique(pa_obs$hru_id),
+    flux  = "q_sf",
+    scale = 1.0,
+    stringsAsFactors = FALSE
+  )
+  cm2 <- dynatop$new(mdl$hru, map = mdl$map)
+  cm2$add_data(obs_input)
+  cm2$initialise()
+  pa_out <- cm2$sim(pa_rows, sub_step = sub_step)$get_output()
+
+  cat("\n=== PA site q_sf ranges ===\n")
+  for(hid in unique(pa_obs$hru_id)){
+    col <- paste0("q_sf_hru", hid)
+    flowing_times <- pa_obs$datetime[pa_obs$hru_id == hid &
+                                       pa_obs$observed == 1]
+    if(col %in% names(pa_out) && length(flowing_times) > 0){
+      sim_during_flow <- as.numeric(pa_out[flowing_times, col])
+      cat(sprintf("HRU %d | during observed flow: min=%.2e max=%.2e | threshold=%.2e\n",
+                  hid, min(sim_during_flow, na.rm=TRUE),
+                  max(sim_during_flow, na.rm=TRUE), FLOW_THRESHOLD))
+    }
+  }
+
+  invisible(list(diag_out = diag_out, pa_out = pa_out))
+}
+
+cat("Running diagnostic with default parameters...\n")
+diag <- run_diagnostic(mdl, obs_cal, pa_obs, outlet_id = OUTLET_ID)
+
+# =============================================================================
+# 6. OBJECTIVE FUNCTIONS
+# =============================================================================
+
+kge <- function(sim, obs){
+  both  <- merge(sim, obs, join = "inner")
+  s     <- as.numeric(both[, 1])
+  o     <- as.numeric(both[, 2])
+  valid <- is.finite(s) & is.finite(o) & abs(s) < 1e3
+  if(sum(valid) < 10) return(-Inf)
+  s <- s[valid]; o <- o[valid]
+  r <- cor(s, o)
+  if(!is.finite(r)) return(-Inf)
+  a <- sd(s) / sd(o)
+  b <- mean(s) / mean(o)
+  1 - sqrt((r - 1)^2 + (a - 1)^2 + (b - 1)^2)
+}
+
+csi_presence_absence <- function(sim_output, pa_obs,
+                                  threshold = FLOW_THRESHOLD){
+  TP <- 0L; FP <- 0L; FN <- 0L; TN <- 0L
+
+  for(hid in unique(pa_obs$hru_id)){
+    col_name <- paste0("q_sf_hru", hid)
+    if(!col_name %in% names(sim_output)) next
+
+    sub_obs <- pa_obs[pa_obs$hru_id == hid, ]
+    if(nrow(sub_obs) == 0) next
+
+    sub_xts <- xts(sub_obs$observed,
+                   order.by = as.POSIXct(sub_obs$datetime, tz = "UTC"))
+    both    <- merge(sim_output[, col_name], sub_xts, join = "inner")
+    if(nrow(both) == 0) next
+
+    sim_bin <- as.integer(as.numeric(both[, 1]) >= threshold)
+    obs_bin <- as.integer(as.numeric(both[, 2]))
+    valid   <- !is.na(sim_bin) & !is.na(obs_bin)
+    sim_bin <- sim_bin[valid]; obs_bin <- obs_bin[valid]
+    if(length(sim_bin) == 0) next
+
+    TP <- TP + sum(sim_bin == 1L & obs_bin == 1L)
+    FP <- FP + sum(sim_bin == 1L & obs_bin == 0L)
+    FN <- FN + sum(sim_bin == 0L & obs_bin == 1L)
+    TN <- TN + sum(sim_bin == 0L & obs_bin == 0L)
+  }
+
+  denom <- TP + FP + FN
+  if(denom == 0) return(NULL)
+
+  list(
+    CSI      = TP / denom,
+    POD      = if((TP + FN) > 0) TP / (TP + FN) else 0,  # recall/sensitivity
+    FAR      = if((TP + FP) > 0) FP / (TP + FP) else 0,  # false alarm rate
+    F1       = if((2*TP + FP + FN) > 0) 2*TP / (2*TP + FP + FN) else 0,
+    accuracy = if((TP+FP+FN+TN) > 0) (TP+TN)/(TP+FP+FN+TN) else 0,
+    TP = TP, FP = FP, FN = FN, TN = TN
+  )
+}
+
+# =============================================================================
+# 7. GLUE
+# =============================================================================
+
+# Weights — must sum to 1
+W_KGE <- 0.6
+W_CSI <- 0.4
+
+# Behavioural thresholds — start permissive, tighten once runs are working
+KGE_THRESHOLD <- -0.5  # raise toward 0.3-0.5 once model is producing good runs
+CSI_THRESHOLD <- 0.0
+
+glue_likelihood <- function(kge_val, csi_val){
+  if(!is.finite(kge_val) || kge_val < KGE_THRESHOLD) return(0)
+  if(!is.finite(csi_val) || csi_val < CSI_THRESHOLD) return(0)
+
+  kge_scaled <- (kge_val - KGE_THRESHOLD) / (1 - KGE_THRESHOLD)
+  csi_scaled <- csi_val  # already 0-1
+
+  # Avoid 0^0 = 1 when weight is 0
+  L_kge <- if(W_KGE > 0) kge_scaled ^ W_KGE else 1
+  L_csi <- if(W_CSI > 0) csi_scaled ^ W_CSI else 1
+
+  L_kge * L_csi
+}
+
+glue_eval <- function(param_vec){
+    params <- setNames(param_vec, param_bounds$name)
+
+    # Hard guards — reject physically implausible combinations immediately
+    if(params["t_d"]    < 900)    return(list(L=0, kge=NA, csi=NA))
+    if(params["v_ch"]   <= 0)     return(list(L=0, kge=NA, csi=NA))
+    if(params["s_rzmax"] <= 0)    return(list(L=0, kge=NA, csi=NA))
+
+    sim <- run_model(params, mdl_template, obs, outlet_id,
+                     pa_hru_ids = unique(pa_obs$hru_id))
+
+    if(is.null(sim)) return(list(L=0, kge=NA, csi=NA))
+
+    sim_vals <- as.numeric(sim)
+    if(any(!is.finite(sim_vals)) || any(abs(sim_vals) > 1e3)){
+      return(list(L=0, kge=NA, csi=NA))
+    }
+
+    kge_val   <- kge(sim[, "q_out"], obs_q)
+    pa_scores <- csi_presence_absence(sim, pa_obs)
+    csi_val   <- if(!is.null(pa_scores) && is.finite(pa_scores$CSI)){
+      pa_scores$CSI
+    } else { 0 }
+
+    L <- glue_likelihood(kge_val, csi_val)
+    list(L = L, kge = kge_val, csi = csi_val)
+  }
+
+run_glue <- function(n_samples,
+                     mdl_template,
+                     obs,
+                     pa_obs,
+                     outlet_id = 0L,
+                     n_cores   = 1L,
+                     seed      = 42L){
+  set.seed(seed)
+  lhs_design   <- randomLHS(n_samples, n_params)
+  param_matrix <- sweep(lhs_design, 2,
+                        param_bounds$upper - param_bounds$lower, "*")
+  param_matrix <- sweep(param_matrix, 2, param_bounds$lower, "+")
+  colnames(param_matrix) <- param_bounds$name
+
+  cat(sprintf("Running %d GLUE samples on %d core(s)...\n",
+              n_samples, n_cores))
+
+  
+
+  if(n_cores > 1L){
+    cl <- makeCluster(n_cores)
+    on.exit(stopCluster(cl), add = TRUE)
+
+    clusterExport(cl,
+      c("mdl_template", 
+        "obs", "obs_q", "pa_obs",
+        "param_bounds", "n_params",
+        "FLOW_THRESHOLD", "W_KGE", "W_CSI",
+        "KGE_THRESHOLD", "CSI_THRESHOLD",
+        "outlet_id",
+        "run_model", "strip_obs",
+        "kge", "csi_presence_absence",
+        "glue_likelihood", "glue_eval"),
+      envir = environment())
+    clusterEvalQ(cl, { library(dynatop); library(xts) })
+
+    score_list <- parApply(cl, param_matrix, 1, glue_eval)
+  } else {
+    score_list <- apply(param_matrix, 1, glue_eval)
+  }
+
+  results <- data.frame(
+    param_matrix,
+    L   = sapply(score_list, `[[`, "L"),
+    kge = sapply(score_list, `[[`, "kge"),
+    csi = sapply(score_list, `[[`, "csi")
+  )
+
+  n_behav <- sum(results$L > 0, na.rm = TRUE)
+  cat(sprintf("Behavioural runs: %d / %d (%.1f%%)\n",
+              n_behav, n_samples, 100 * n_behav / n_samples))
+
+  if(n_behav == 0)
+    cat("No behavioural runs — lower KGE_THRESHOLD or run diagnostic.\n")
+
+  results$L_norm <- ifelse(sum(results$L) > 0,
+                           results$L / sum(results$L), NA_real_)
+
+  results[order(-results$L), ]
+}
+
+# =============================================================================
+# 8. UNCERTAINTY BOUNDS
+# =============================================================================
+
+glue_uncertainty_bounds <- function(glue_results, mdl_template, obs, obs_q,
+                                     outlet_id = 0L,
+                                     quantiles  = c(0.05, 0.95)){
+  behav <- glue_results[glue_results$L > 0 & !is.na(glue_results$L), ]
+  if(nrow(behav) == 0) stop("No behavioural runs.")
+  cat(sprintf("Computing uncertainty bounds from %d behavioural runs...\n",
+              nrow(behav)))
+
+  sim_list <- lapply(seq_len(nrow(behav)), function(i){
+    params <- setNames(as.numeric(behav[i, param_bounds$name]), param_bounds$name)
+    sim    <- run_model(params, mdl_template, obs, outlet_id)
+    if(is.null(sim)) return(NULL)
+    as.numeric(sim[, "q_out"])
+  })
+
+  good      <- !sapply(sim_list, is.null)
+  sim_list  <- sim_list[good]
+  L_w       <- behav$L_norm[good]
+  L_w       <- L_w / sum(L_w)  # re-normalise over successful runs
+  sim_matrix <- do.call(cbind, sim_list)
+
+  bounds <- data.frame(
+    datetime = index(strip_obs(obs)),
+    q_obs    = as.numeric(obs_q),
+    q_best   = sim_matrix[, which.max(L_w)],
+    q_mean   = apply(sim_matrix, 1, weighted.mean, w = L_w)
+  )
+
+  for(q in quantiles){
+    col_name <- paste0("q_", sprintf("%02d", round(q * 100)))
+    bounds[[col_name]] <- apply(sim_matrix, 1, function(row){
+      ord  <- order(row)
+      cumw <- cumsum(L_w[ord])
+      row[ord][which(cumw >= q)[1]]
+    })
+  }
+  bounds
+}
+
+plot_glue_bounds <- function(bounds){
+  t_idx  <- bounds$datetime
+  y_max  <- max(c(bounds$q_obs, bounds$q_95), na.rm = TRUE) * 1.1
+
+  plot(t_idx, bounds$q_obs, type = "l", col = "black", lwd = 1.5,
+       ylim = c(0, y_max),
+       main = "GLUE uncertainty bounds vs observed [m³/s]",
+       xlab = "", ylab = "m³/s")
+
+  polygon(c(t_idx, rev(t_idx)),
+          c(bounds$q_05, rev(bounds$q_95)),
+          col = adjustcolor("steelblue", alpha.f = 0.3), border = NA)
+
+  lines(t_idx, bounds$q_best, col = "firebrick", lwd = 1.5)
+  lines(t_idx, bounds$q_mean, col = "steelblue", lwd = 1, lty = 2)
+
+  legend("topright",
+         legend = c("Observed", "Best likelihood", "Weighted mean", "5–95% band"),
+         col    = c("black", "firebrick", "steelblue",
+                    adjustcolor("steelblue", 0.4)),
+         lwd    = c(1.5, 1.5, 1, 8), lty = c(1, 1, 2, 1))
+}
+
+plot_glue_dotty <- function(glue_results){
+  behav    <- glue_results[glue_results$L > 0 & !is.na(glue_results$L), ]
+  nonbehav <- glue_results[is.na(glue_results$L) | glue_results$L == 0, ]
+
+  par(mfrow = c(3, 3))
+  for(pn in param_bounds$name){
+    ymax <- if(nrow(behav) > 0) max(behav$L, na.rm=TRUE) else 1
+    xlim <- c(param_bounds$lower[param_bounds$name == pn],
+              param_bounds$upper[param_bounds$name == pn])
+    plot(nonbehav[[pn]], nonbehav$L,
+         xlab = pn, ylab = "Likelihood",
+         pch = 16, cex = 0.4, col = "grey70",
+         ylim = c(0, ymax), xlim = xlim)
+    if(nrow(behav) > 0)
+      points(behav[[pn]], behav$L, pch = 16, cex = 0.7, col = "firebrick")
+    abline(h = 0, lty = 2, col = "grey50")
+  }
+  par(mfrow = c(1, 1))
+}
+
+# =============================================================================
+# 9. RUN
+# =============================================================================
+
+# ── Quick sanity check: do two extreme param sets give different output? ───────
+cat("\nSanity check: comparing extreme parameter sets...\n")
+p_low  <- setNames(param_bounds$lower, param_bounds$name)
+p_high <- setNames(param_bounds$upper, param_bounds$name)
+p_low["t_d"]  <- 7200; p_high["t_d"] <- 86400  # keep above 900s guard
+
+s_low  <- run_model(p_low,  mdl, obs_cal, outlet_id = OUTLET_ID)
+s_high <- run_model(p_high, mdl, obs_cal, outlet_id = OUTLET_ID)
+
+if(!is.null(s_low) && !is.null(s_high)){
+  cat("low  params q_out range:", range(as.numeric(s_low[,"q_out"])),  "\n")
+  cat("high params q_out range:", range(as.numeric(s_high[,"q_out"])), "\n")
+  cat("KGE low: ", kge(s_low[,"q_out"],  obs_q), "\n")
+  cat("KGE high:", kge(s_high[,"q_out"], obs_q), "\n")
+} else {
+  cat("One or both extreme runs returned NULL — check run_model errors.\n")
+}
+
+mdl_template <<- mdl
+outlet_id    <<- OUTLET_ID
+hru <- mdl$hru
+# ── GLUE ─────────────────────────────────────────────────────────────────────
+glue_results <- run_glue(
+  n_samples    = 2000,
+  mdl_template = mdl,
+  obs          = obs_cal,   # discharge stripped inside run_model
+  pa_obs       = pa_obs,
+  outlet_id    = OUTLET_ID,
+  n_cores      = 4L,
+  seed         = 42L
+)
+saveRDS(glue_results, "glue_results.rds")
+
+cat("\nTop 10 behavioural runs:\n")
+print(head(glue_results[glue_results$L > 0 & !is.na(glue_results$L),
+           c(param_bounds$name, "L", "kge", "csi")], 10))
+
+# =============================================================================
+# 10. EVALUATE BEST PARAMETER SET
+# =============================================================================
+
+best_params <- setNames(as.numeric(glue_results[1, param_bounds$name]),
+                        param_bounds$name)
+
+best_sim <- run_model(best_params, mdl, obs_cal,
+                      outlet_id  = OUTLET_ID,
+                      pa_hru_ids = unique(pa_obs$hru_id))
+
+cat("\nBest run evaluation:\n")
+cat("KGE:", kge(best_sim[,"q_out"], obs_q), "\n")
+pa_best <- csi_presence_absence(best_sim, pa_obs)
+cat(sprintf("CSI=%.3f  POD=%.3f  FAR=%.3f  TP=%d FP=%d FN=%d TN=%d\n",
+            pa_best$CSI, pa_best$POD, pa_best$FAR,
+            pa_best$TP, pa_best$FP, pa_best$FN, pa_best$TN))
+
+# ── Discharge plot ─────────────────────────────────────────────────────────────
+plot(merge(obs_q, best_sim[,"q_out"]),
+     main = "Observed vs Simulated discharge [m³/s]",
+     legend.loc = "topright",
+     col = c("black", "firebrick"))
+
+# ── Dotty plots ────────────────────────────────────────────────────────────────
+plot_glue_dotty(glue_results)
+
+# ── PA site plots ─────────────────────────────────────────────────────────────
+for(hid in unique(pa_obs$hru_id)){
+  col_name <- paste0("q_sf_hru", hid)
+  if(!col_name %in% names(best_sim)) next
+
+  sim_q <- best_sim[, col_name]
+  sub   <- pa_obs[pa_obs$hru_id == hid, ]
+
+  plot(sim_q, main = paste("HRU", hid, "— simulated q_sf vs observations"),
+       ylab = "m³/s", col = "steelblue")
+  abline(h = FLOW_THRESHOLD, lty = 2, col = "grey40")
+
+  flowing <- sub[sub$observed == 1, ]
+  dry     <- sub[sub$observed == 0, ]
+
+  if(nrow(flowing) > 0){
+    times_f <- sort(unique(as.POSIXct(flowing$datetime, tz="UTC")))
+    rect(xleft=head(times_f,-1), xright=tail(times_f,-1),
+         ybottom=0, ytop=par("usr")[4],
+         col=adjustcolor("green",0.15), border=NA)
+  }
+  if(nrow(dry) > 0){
+    times_d <- sort(unique(as.POSIXct(dry$datetime, tz="UTC")))
+    rect(xleft=head(times_d,-1), xright=tail(times_d,-1),
+         ybottom=0, ytop=par("usr")[4],
+         col=adjustcolor("red",0.1), border=NA)
+  }
+  legend("topright",
+         legend = c("Simulated q_sf", "Flow threshold",
+                    "Obs: flowing", "Obs: dry"),
+         col    = c("steelblue","grey40",
+                    adjustcolor("green",0.4), adjustcolor("red",0.3)),
+         lty = c(1,2,NA,NA), pch = c(NA,NA,15,15))
+}
+
+# ── Uncertainty bounds (only if enough behavioural runs) ─────────────────────
+n_behav <- sum(glue_results$L > 0, na.rm=TRUE)
+if(n_behav >= 10){
+  bounds <- glue_uncertainty_bounds(glue_results, mdl, obs_cal, obs_q,
+                                    outlet_id = OUTLET_ID)
+  plot_glue_bounds(bounds)
+} else {
+  cat("Fewer than 10 behavioural runs — skipping uncertainty bounds.\n",
+      "Lower KGE_THRESHOLD or increase n_samples.\n")
+}
+```
+
+
+
+# Out of place code
+```{r}
+
+## create a vector of the uid's of the HRUs
+hid <- sapply(mdl$hru,function(h){h$id})
+## create a vector of the channel names with as storaged in the class variabel
+cname <- sapply(mdl$hru,function(h){h$class$name})
+idx <- match(gauges$chn_identi, cname) ## index of HRU's corresponding to gauges
+## create as a data.frame
+gauge_output <- data.frame(name = gauges$Site.Name,
+                           id = as.integer(hid[idx]),
+                           flux = "q_sf",
+                           scale = 1)
+saveRDS(gauge_output,file.path(".","dyna","gauge_output_defn.rds")) ## save the output for later use
+gauge_output
+```
+```{r}
+# Check if parameters are actually changing between runs
+params_low  <- setNames(param_bounds$lower, param_bounds$name)
+params_high <- setNames(param_bounds$upper, param_bounds$name)
+
+sim_low  <- run_model(params_low,  mdl, obs_cal[,-1], outlet_id = OUTLET_ID,
+                      pa_hru_ids = unique(pa_obs$hru_id))
+sim_high <- run_model(params_high, mdl, obs_cal[,-1], outlet_id = OUTLET_ID,
+                      pa_hru_ids = unique(pa_obs$hru_id))
+
+cat("sim_low  q_out range:", range(as.numeric(sim_low[,"q_out"])),  "\n")
+cat("sim_high q_out range:", range(as.numeric(sim_high[,"q_out"])), "\n")
+
+# Also verify parameters are being set correctly inside run_model
+# Add this temporarily at the top of run_model(), after the parameter loop:
+cat("t_0 set to:", hru[[1]]$sz$parameters["t_0"], "\n")
+cat("m   set to:", hru[[1]]$sz$parameters["m"],   "\n")
+```
+
+# Potentially obsolete
+
+```{r}
+# RUN MODEL
+mdl <- readRDS(file.path(".","dynaGIS","atb_20.rds"))
+obs <- readRDS(file.path(".","processed","obs.rds"))
+hru <- mdl$hru
+
+#hru <- lapply(hru, function(h){ h$uz$parameters["t_d"] <- 8 * 60 * 60; h})
+# 1. Use the outlet_id you generated in your GIS prep chunk
+output_defn <- data.frame(name = "W3",
+                          id = 1, # <-- USE YOUR VARIABLE HERE
+                          flux = "q_sf",
+                          scale = 1)
+
+
+r0 <- as.numeric(obs$Discharge_m3_s[1])
+hru <- lapply(hru, function(h) { h$initialisation["r_uz_sz_0"] <- r0; h })
+
+# 3. Run the model
+ctch_mdl <- dynatop$new(mdl$hru, map = mdl$map)$
+  add_data(obs)$
+  initialise()$
+  sim(output_defn,
+      sub_step = 900)
+
+# 4. Extract and scale flow
+sim_rate <- ctch_mdl$get_output() 
+sim_vol_m3_day <- sim_rate * 86400 
+
+catchment_area <- sum(sapply(hru, function(x) x$properties["area"]))
+sim_specific_m_day <- sim_vol_m3_day / catchment_area
+
+plot(ctch_mdl$get_output(), type = 'p')
+# 5. Plot
+plot(merge(obs$Discharge_m3_s, sim_rate), 
+     main="Simulated vs Observed Specific Discharge (m/day)",
+     legend.loc='topleft')
+```
+
+```{r map}
+# 1. Load the model object
+mdl <- readRDS(file.path(".", "dynaGIS", "atb_20.rds"))
+
+# 2. Read the spatial map of HRUs 
+# (mdl$map stores the file path to the HRU tif generated by dynatopGIS)
+hru_map <- rast(".", "dynaGIS", "atb_20.rds") 
+
+# Rename the raster layer so we can call it easily in ggplot
+names(hru_map) <- "hru_id"
+
+# 3. Convert the raster to polygons to calculate the center of each HRU
+hru_poly <- as.polygons(hru_map)
+
+# Calculate the centroids (center points) of each polygon for the text labels
+hru_centroids <- centroids(hru_poly)
+
+# Extract coordinates into a standard dataframe for ggplot
+centroid_coords <- crds(hru_centroids, df = TRUE)
+centroid_coords$hru_id <- hru_centroids$hru_id
+
+# 4. Plot using tidyterra and ggplot2
+ggplot() +
+  # Plot the raster base map (using factor for discrete colors)
+  geom_spatraster(data = as.factor(hru_map)) +
+  # Overlay the polygon boundaries
+  geom_spatvector(data = hru_poly, fill = NA, color = "black", linewidth = 0.3) +
+  # Add the ID labels at the center of each HRU
+  geom_text(data = centroid_coords, aes(x = x, y = y, label = hru_id), 
+            color = "white", fontface = "bold", size = 4) +
+  # Use a nice color palette and remove the bulky legend
+  scale_fill_viridis_d(option = "turbo", na.value = "transparent", guide = "none") +
+  theme_minimal() +
+  labs(title = "Hubbard Brook HRU & Channel ID Map",
+       subtitle = "Hillslopes (1-20) and Channels (21+)",
+       x = "Longitude", y = "Latitude")
+```
+
+```{r Mass Balance}
+mb <- ctch_mdl$get_mass_errors()
+head(mb)
+tail(mb)
+plot( mb$outflow, main="Mass balance error",ylab="m^3")
+plot( mb$e_t, main="Mass balance error",ylab="m^3")
+
+plot( mb$p/catchment_area , main="Mass balance error",ylab="m^3")
+
+plot( mb$initial_state , main="Mass balance error",ylab="m^3")
+
+mdl$output_flux
+
+ctch_mdl$plot_output()
+```
+
+```{r}
+## extract the current states as a data.frame
+current_state <- ctch_mdl$get_states()
+## rows correspond to the Hill-slope HRU ID, and the storage's in each of the four zones
+head(current_state)
+
+ctch_mdl$plot_state("s_sf")
+ctch_mdl$plot_state("s_rz")
+ctch_mdl$plot_state("s_uz")
+ctch_mdl$plot_state("s_sz")
+```
+
+```{r changing parameters}
+
+chn_id <- do.call(c, lapply( hru, function(h){ if(!is.na(h$class$startNode)){ h$id } }))
+
+out_hyd <-  data.frame( name = paste0("hyd_",chn_id),
+                       id = chn_id,
+                       flux = "v_sf_rz", scale =-1/900) # scale is negative since flux usually downwards, 1/900 is 1/timestep
+
+out_hyd <-  data.frame( name = paste0("hyd_",chn_id),
+                       id = chn_id,
+                       flux = "v_sf_rz", scale =-1/900)
+output_defn <- out_hyd[2,]
+## function to compute the relevent part so the output definition for each potential source HRU
+fout <- function(h){
+    ## test if it is a channel HRU - in which case return NULL
+    if( !is.na(h$class$startNode) ){ return(NULL) }
+        
+    ## index of flow directiuons going to other channels
+    idx <- h$sf_flow_direction$id %in% chn_id
+    if(!any(idx)){ return(NULL) } ## quit if no links!
+    ## create partial output defn
+    data.frame(
+        name = paste0("hyd_",h$sf_flow_direction$id[idx]), ## which inflow does it alter
+        id = h$id, ## flux comes from this HRU
+        flux = "q_sf", # surface flux out of this HRU is input to the next
+        scale = h$sf_flow_direction$fraction[idx] # scale is fraction of flow (since taking it away)
+    )
+}
+## row bind to give a data.frame
+tmp <- do.call( rbind, lapply( hru, fout) )
+
+## row bind onto the intial data frame
+out_hyd <- rbind( out_hyd, tmp )
+
+## sort this, not needed but easier to look at
+out_hyd <- out_hyd[ order(out_hyd$name), ]
+
+ctch_mdl <- dynatop$new(hru)$add_data(obs)$initialise()$sim(output_defn)
+plot( merge(obs$Discharge_m3_s ,ctch_mdl$get_output()), legend.loc='topright')
+```
