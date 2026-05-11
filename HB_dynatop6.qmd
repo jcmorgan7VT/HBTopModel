@@ -1,0 +1,3665 @@
+---
+title: "HB_dynatop6"
+format: html
+editor_options: 
+  chunk_output_type: console
+---
+Difference from dynatop5:
+- settle on just soils and TWI determining HRUs
+- parameterize 3 different parameter sets for subsurface characteristics for 3 soil types
+
+How well this process based model can capture the presence and absence of flow?
+
+```{r setup}
+# Load packages
+library(pacman)
+p_load(terra, xts, whitebox, tidyverse,
+       lubridate,
+       dynatopGIS,
+       sf, # working with st and sf objects
+       tidyterra, # do tidy ops on terra objects
+       sfnetworks, # create start and end nodes for channel network
+       lwgeom,
+       lhs, DEoptim, # maybe obsolete since I am using GLUE
+       parallel,
+       readr
+       )
+
+# Load modified version of dynatop, which includes snow routine
+devtools::load_all(file.path("/Users/johnmorgan/Documents/HBTopModel/revised_package/dynatop")) ## attach the revised package
+
+crs1 <- "PROJCRS[\"NAD83 / UTM zone 19N\",\n    BASEGEOGCRS[\"NAD83\",\n        DATUM[\"North American Datum 1983\",\n            ELLIPSOID[\"GRS 1980\",6378137,298.257222101,\n                LENGTHUNIT[\"metre\",1]]],\n        PRIMEM[\"Greenwich\",0,\n            ANGLEUNIT[\"degree\",0.0174532925199433]],\n        ID[\"EPSG\",4269]],\n    CONVERSION[\"UTM zone 19N\",\n        METHOD[\"Transverse Mercator\",\n            ID[\"EPSG\",9807]],\n        PARAMETER[\"Latitude of natural origin\",0,\n            ANGLEUNIT[\"degree\",0.0174532925199433],\n            ID[\"EPSG\",8801]],\n        PARAMETER[\"Longitude of natural origin\",-69,\n            ANGLEUNIT[\"degree\",0.0174532925199433],\n            ID[\"EPSG\",8802]],\n        PARAMETER[\"Scale factor at natural origin\",0.9996,\n            SCALEUNIT[\"unity\",1],\n            ID[\"EPSG\",8805]],\n        PARAMETER[\"False easting\",500000,\n            LENGTHUNIT[\"metre\",1],\n            ID[\"EPSG\",8806]],\n        PARAMETER[\"False northing\",0,\n            LENGTHUNIT[\"metre\",1],\n            ID[\"EPSG\",8807]]],\n    CS[Cartesian,2],\n        AXIS[\"(E)\",east,\n            ORDER[1],\n            LENGTHUNIT[\"metre\",1]],\n        AXIS[\"(N)\",north,\n            ORDER[2],\n            LENGTHUNIT[\"metre\",1]],\n    USAGE[\n        SCOPE[\"Engineering survey, topographic mapping.\"],\n        AREA[\"North America - between 72°W and 66°W - onshore and offshore. Canada - Labrador; New Brunswick; Nova Scotia; Nunavut; Quebec. Puerto Rico. United States (USA) - Connecticut; Maine; Massachusetts; New Hampshire; New York (Long Island); Rhode Island; Vermont.\"],\n        BBOX[14.92,-72,84,-66]],\n    ID[\"EPSG\",26919]]"
+```
+
+# GIS PREP
+Aggregate to coarser spatial resolution
+```{r GIS files}
+target_folder <- "./5th_attempt/unprocessed/"
+dem_path <- file.path(".", "hb_data", "unprocessed",
+                      "1m hydro enforced dem","hydem1mlpns.tif")
+dem <- rast(dem_path) # load the dem as a raster layer
+
+# crop DEM to a rough rectangle
+ybounds <- c(4870350,4871350)
+xbounds <- c(281350, 282150)
+crop1 <- crop(dem, ext(c(xbounds, ybounds)))
+plot(crop1)
+
+dem3 <- terra::aggregate(crop1, 5, fun = "mean")
+#save raster, because whitebox wants it is a files location instead of an object in R
+crop_3mdem_path <- paste0(target_folder, "3mdem.tif")
+writeRaster(dem3, crop_3mdem_path, overwrite = TRUE)
+
+####delineate watershed and keep watershed boundary
+
+w3_breached <- paste0(target_folder,"3mdem_breach.tif")
+wbt_breach_depressions_least_cost(
+  dem = crop_3mdem_path,
+  output = w3_breached,
+  dist = 5,
+  fill = TRUE)
+
+w3_filled <- paste0(target_folder,"3mdem_fill.tif")
+wbt_fill_depressions_wang_and_liu(
+  dem = w3_breached,
+  output = w3_filled
+)
+#calculate flow accumulation and direction
+w3_flowacc <- paste0(target_folder,"3mdem_flowacc.tif")
+wbt_d8_flow_accumulation(input = w3_filled,
+                         output = w3_flowacc)
+w3_d8pt <- paste0(target_folder,"3mdem_d8pt.tif")
+wbt_d8_pointer(dem = w3_filled,
+               output = w3_d8pt)
+
+#delineate streams
+w3_streams <- paste0(target_folder,"streams.tif")
+wbt_extract_streams(flow_accum = w3_flowacc,
+                    output = w3_streams,
+                    threshold = 200)
+plot(rast(w3_streams))
+
+# convert streams to shapefile
+w3_streams_vect <- paste0(target_folder,"streams_vect.shp")
+wbt_raster_streams_to_vector(streams = w3_streams,
+                             d8_pntr = w3_d8pt,
+                             output = w3_streams_vect)
+plot(vect(w3_streams_vect))
+
+# get pour point ready
+pour_point_path <- file.path(".", "hb_data",
+                             "unprocessed",
+                             "1m hydro enforced dem", "w3_pour_snap.shp")
+plot(vect(pour_point_path), add = TRUE)
+
+w3_pour_snap <- paste0(target_folder,"pour.shp")
+wbt_jenson_snap_pour_points(pour_pts = pour_point_path,
+                            streams = w3_streams,
+                            output = w3_pour_snap,
+                            snap_dist = 10)
+w3_pour_snap_read <- vect(w3_pour_snap)
+plot(rast(w3_streams), 
+     xlim = c(281400, 282000),
+     ylim = c(4870400, 4870800))
+points(w3_pour_snap_read, pch = 1)
+
+
+w3_shed <- paste0(target_folder,"shed.tif")
+wbt_watershed(d8_pntr = w3_d8pt,
+              pour_pts = w3_pour_snap,
+              output = w3_shed)
+
+plot(rast(w3_shed))
+#convert raster of watershed area to vector for final mapping
+w3_outline <- as.polygons(rast(w3_shed), extent=FALSE)
+plot(w3_outline)
+
+plot(w3_outline)
+
+channel <- vect(w3_streams_vect, crs = crs1) %>% 
+  crop(w3_outline)
+
+
+# crop and mask DEM by watershed outline
+dem_crop_mask <- rast(w3_filled) %>% 
+  crop(w3_outline) %>% 
+  mask(w3_outline)
+
+#create watershed area, just use area of DEM
+outline <- (dem_crop_mask * 0) + 1
+# extend both rasters by 1 pixel
+outline_extended <- extend(outline,1)
+dem_final <- extend(dem_crop_mask,1)
+
+# STIC locations
+all_24 <- read_csv("/Users/johnmorgan/Documents/VT Research/HBTopModel/STIC_Synthesis/all_24.csv")
+
+stic_locs <- all_24 %>%
+  filter(wshed == "W3") %>%
+  select(number, lat, long) %>%
+  distinct() %>%
+  vect(geom = c("long", "lat"), crs = "EPSG:4326") %>%
+  project("EPSG:26919")
+# save STIC locations, un-snapped
+stic_locs_not_snapped <- paste0(target_folder,"not_snapped_stics.shp")
+writeVector(stic_locs, stic_locs_not_snapped, overwrite = TRUE)
+# snap STIC sensors to channel network
+stic_locs_snapped <- paste0(target_folder,"snapped_stics.shp")
+
+wbt_jenson_snap_pour_points(pour_pts = stic_locs_not_snapped,
+                            streams = w3_streams,
+                            output = stic_locs_snapped,
+                            snap_dist = 30)
+ggplot() +
+  # Plot the raster base map (using factor for discrete colors)
+  geom_spatvector(data = w3_outline) +
+    geom_spatvector(data = channel, color = "blue") +
+  geom_spatvector(data = vect(stic_locs_snapped), color = "black")+
+  theme_void()
+
+processed_folder <- "./5th_attempt/processed/"
+
+writeRaster(outline_extended, paste0(processed_folder, "w3.tif"),overwrite=TRUE)
+writeRaster(dem_final,paste0(processed_folder, "dem.tif"),overwrite=TRUE)
+```
+```{r build channel}
+# =============================================================================
+# build_dynatop_channel.R  (v3 — definitive)
+#
+# ROOT CAUSE (discovered from HRU 39 endNode=30, sf_flow_direction=47):
+#   convert_channel sets each channel HRU's id    = startNode value
+#                                    sf_flow_dir  = endNode value
+#   It never uses the 'name' column for ordering.
+#
+# Therefore the startNode/endNode values in the SpatVector passed to
+# convert_channel MUST themselves be topologically ordered integers:
+#   outlet segment startNode = 1 (lowest)
+#   every upstream segment startNode > its downstream segment's startNode
+#
+# All previous scripts sorted rows and assigned 'name' = 1..N but left the
+# original sfnetwork-derived node ids in startNode/endNode untouched.
+# Those arbitrary node ids (e.g. 30, 47) are what convert_channel actually
+# uses, so the ordering we imposed on 'name' had no effect.
+#
+# This script replaces startNode/endNode with fresh topological ids BEFORE
+# calling convert_channel.
+# =============================================================================
+
+locs <- vect(stic_locs_snapped)
+
+## They've been trying to stop the wave, but the wave don't stop
+channel <- vect(w3_streams_vect, crs = crs1) %>% 
+  crop(w3_outline) %>% 
+    mutate(ID = seq(1, n(), 1))
+
+plot(channel)
+
+ggplot()+
+  geom_spatvector(data = channel)+
+  geom_spatvector_text(data = channel, aes(label = ID))+
+  geom_spatvector(data = locs, color = "blue")
+channel_trimmed <- channel %>%
+  filter(!ID %in% c(1, 8,9, 12, 19, 4, 39, 25, 15))
+
+ggplot()+
+  geom_spatvector(data = channel_trimmed)+
+  geom_spatvector_text(data = channel_trimmed, aes(label = ID))+
+    geom_spatvector(data = locs, color = "blue")
+
+sv <- channel_trimmed %>% 
+  select(ID)
+sv_sf <- st_as_sf(sv)
+
+# Function to merge selected names into single row
+names_to_merge1 <- c(3,2,7,6)
+
+# inputs:
+#' @param names_to_merge Identifying column of lines to merge
+#' @param sv_sf SV converted to SF to combine elements of
+#' @return all_rows, combined sf object
+# Don't renumber segments, so several can be chained together from initial assessment
+merge_segments <- function(names_to_merge, sv_sf){
+  others <- sv_sf[!sv_sf$ID %in% names_to_merge, ]
+  to_merge <- sv_sf[sv_sf$ID %in% names_to_merge, ]
+  
+  merged_geom <- st_union(st_geometry(to_merge))
+  
+  merged_row <- st_sf(
+    ID = names_to_merge[1],
+    geometry = merged_geom)
+  
+  all_rows <- rbind(merged_row, others)
+  return(all_rows)
+}
+
+test <- merge_segments(names_to_merge = c(3,2,7,6),
+                       sv_sf = sv_sf)
+vect_final <- vect(test) %>% 
+  # renumber segments
+  mutate(ID = row_number())
+
+ggplot() +
+  # Plot the raster base map (using factor for discrete colors)
+  geom_spatvector(data = vect_final) +
+  geom_spatvector_text(data = vect_final, aes(label = ID))+
+  geom_spatvector(data = stic_locs, color = "blue")#+
+  lims(x = c(281500, 281700),
+       y = c(4870400, 4870500))+
+  theme_minimal() 
+
+# writeVector(
+#   vect_final,
+#   file.path(".", "hb_data", "processed", "channel.shp"),
+#   overwrite = TRUE
+# )
+
+test2 <- terra::aggregate(vect_final)
+
+new_data <- data.frame(ID = 1)
+values(test2) <- new_data
+# =============================================================================
+# Main function
+# =============================================================================
+
+#' Build a topologically correct channel SpatVector for dynatop
+#'
+#' @param channel_sv       SpatVector of directed channel lines (upstream to downstream).
+#' @param split_points_sv  SpatVector of points marking desired HRU boundaries.
+#' @param snap_tolerance   Max snap distance in map units. Points beyond this warn.
+#' @param node_tolerance   Coordinate precision for merging coincident endpoints.
+#' @param default_width    Channel width assigned to all segments.
+#' @param default_slope    Slope assigned to all segments.
+#'
+#' @return List with three elements:
+#'   $channel_sv    SpatVector ready for convert_channel. startNode values are
+#'                  topological ids (outlet = 1). endNode = downstream id (0 at outlet).
+#'   $channel_df    data.frame of the same, for inspection and validation.
+#'   $conv_channel  Output of convert_channel — pass directly to dynatop.
+
+build_dynatop_channel <- function(
+    channel_sv,
+    split_points_sv,
+    snap_tolerance = 1,
+    node_tolerance = 0.01,
+    default_width  = 1,
+    default_slope  = 0.001
+) {
+
+  # ── 0. CRS alignment ─────────────────────────────────────────────────────────
+  channel_sf <- st_cast(st_as_sf(channel_sv), "LINESTRING")
+  points_sf  <- st_as_sf(split_points_sv)
+  if (st_crs(channel_sf) != st_crs(points_sf)) {
+    message("CRS mismatch — reprojecting split points.")
+    points_sf <- st_transform(points_sf, st_crs(channel_sf))
+  }
+  message(sprintf("Input: %d line feature(s), %d split point(s).",
+                  nrow(channel_sf), nrow(points_sf)))
+
+  # ── 1. Snap split points to nearest position on the channel ──────────────────
+  channel_union <- st_union(channel_sf)
+  nearest_segs  <- st_nearest_points(points_sf, channel_union)
+  snapped_pts   <- st_cast(nearest_segs, "POINT")[seq(2, 2*nrow(points_sf), 2)]
+
+  snap_dists <- as.numeric(st_distance(
+    points_sf, st_sf(geometry = snapped_pts), by_element = TRUE
+  ))
+  far <- which(snap_dists > snap_tolerance)
+  if (length(far) > 0)
+    warning(sprintf("%d point(s) >%g map units from channel (rows: %s).",
+                    length(far), snap_tolerance, paste(far, collapse=",")),
+            call.=FALSE)
+
+  # ── 2. Split each line at points that fall on it ──────────────────────────────
+  segment_list <- vector("list", nrow(channel_sf))
+  for (i in seq_len(nrow(channel_sf))) {
+    this_line    <- channel_sf[i, ]
+    dist_to_line <- as.numeric(st_distance(st_sf(geometry = snapped_pts), this_line))
+    on_this      <- which(dist_to_line <= node_tolerance * 10)
+
+    if (length(on_this) == 0) {
+      segment_list[[i]] <- st_sf(geometry = st_geometry(this_line))
+    } else {
+      pts_u <- st_union(snapped_pts[on_this])
+      parts <- tryCatch(
+        st_collection_extract(lwgeom::st_split(this_line, pts_u), "LINESTRING"),
+        error = function(e) {
+          warning(sprintf("Split failed on line %d — kept unsplit.", i), call.=FALSE)
+          this_line
+        }
+      )
+      segment_list[[i]] <- st_sf(geometry = st_geometry(parts))
+    }
+  }
+
+  all_segs <- do.call(rbind, segment_list)
+  rownames(all_segs) <- NULL
+  n_segs <- nrow(all_segs)
+  message(sprintf("After splitting: %d segment(s).", n_segs))
+
+  # ── 3. Build coordinate-based node topology ────────────────────────────────
+  # Directed lines: first coordinate = upstream end, last = downstream end.
+  precision <- max(0, ceiling(-log10(node_tolerance)) + 1)
+  get_endpoints <- function(geom) {
+    co <- st_coordinates(geom)
+    rbind(round(co[1,        c("X","Y")], precision),
+          round(co[nrow(co), c("X","Y")], precision))
+  }
+
+  ep_matrix   <- do.call(rbind, lapply(seq_len(n_segs), function(i) get_endpoints(all_segs[i,])))
+  coord_keys  <- paste(ep_matrix[,"X"], ep_matrix[,"Y"])
+  unique_keys <- unique(coord_keys)
+  node_ids    <- match(coord_keys, unique_keys)
+  start_ids   <- node_ids[seq(1, 2*n_segs, 2)]  # coord-based, arbitrary integers
+  end_ids     <- node_ids[seq(2, 2*n_segs, 2)]
+
+  # ── 4. Topological sort — BFS from outlet ────────────────────────────────────
+  sn_to_row <- setNames(seq_len(n_segs), as.character(start_ids))
+  ds        <- unname(sn_to_row[as.character(end_ids)])  # NA = outlet
+
+  outlets <- which(is.na(ds))
+  if (length(outlets) == 0)
+    stop(paste0(
+      "No outlet found — every segment's end connects to another segment's start.\n",
+      "Verify that lines are directed upstream → downstream."
+    ))
+  if (length(outlets) > 1)
+    warning(sprintf(
+      "%d outlets detected — network may be disconnected or have unjoined tributaries.",
+      length(outlets)
+    ), call.=FALSE)
+
+  upstream_of <- vector("list", n_segs)
+  for (i in seq_len(n_segs))
+    if (!is.na(ds[i])) upstream_of[[ds[i]]] <- c(upstream_of[[ds[i]]], i)
+
+  visited   <- logical(n_segs)
+  new_order <- integer(0)
+  queue     <- outlets
+  while (length(queue) > 0) {
+    cur <- queue[1]; queue <- queue[-1]
+    if (!visited[cur]) {
+      visited[cur] <- TRUE
+      new_order    <- c(new_order, cur)
+      queue        <- c(queue, upstream_of[[cur]])
+    }
+  }
+
+  unreachable <- setdiff(seq_len(n_segs), new_order)
+  if (length(unreachable) > 0)
+    warning(sprintf(
+      "%d segment(s) unreachable from the outlet — possible cycle or disconnected sub-network.",
+      length(unreachable)
+    ), call.=FALSE)
+
+  n_sorted <- length(new_order)
+
+  # ── 5. THE KEY STEP: replace startNode/endNode with topological ids ───────────
+  #
+  # convert_channel uses startNode as each HRU's id, and endNode as its
+  # sf_flow_direction. So these values — not 'name', not row order — must be
+  # topologically ordered so that endNode < startNode for every non-outlet.
+  #
+  # BFS order gives us: new_order[1] = outlet row, new_order[n] = headwaters.
+  # Assign topo_id = position in new_order, so outlet gets topo_id = 1.
+  # Each segment's downstream row has a LOWER topo_id by construction.
+
+  topo_id   <- seq_len(n_sorted)  # 1 = outlet, n_sorted = farthest headwater
+
+  # Find downstream topo_id for each sorted segment
+  sorted_start_orig <- start_ids[new_order]
+  sorted_end_orig   <- end_ids[new_order]
+  sn_orig_to_sorted_row <- setNames(seq_len(n_sorted), as.character(sorted_start_orig))
+  ds_sorted <- unname(sn_orig_to_sorted_row[as.character(sorted_end_orig)])  # NA = outlet
+
+  # New startNode = this segment's topo_id
+  # New endNode   = downstream segment's topo_id; 0 for outlet
+  new_startNode <- topo_id
+  new_endNode   <- ifelse(is.na(ds_sorted), 0L, topo_id[ds_sorted])
+
+  # Guarantee: for all non-outlet, new_endNode < new_startNode
+  # Because ds_sorted[i] < i always (BFS visits downstream before upstream)
+  violations <- which(new_endNode != 0 & new_endNode >= new_startNode)
+  if (length(violations) > 0)
+    stop(sprintf(
+      "BUG: topological id assignment still has violations at sorted rows: %s.\n",
+      paste(violations, collapse=", ")
+    ), "Please file a bug report.")
+
+  sorted_lengths <- as.numeric(st_length(all_segs[new_order, ]))
+
+  # ── 6. Assemble output ───────────────────────────────────────────────────────
+  channel_df <- data.frame(
+    name      = topo_id,          # label = id for clarity; convert_channel reads this as label only
+    startNode = new_startNode,    # THIS is what becomes the HRU id in dynatop
+    endNode   = new_endNode,      # THIS is what becomes sf_flow_direction
+    length    = sorted_lengths,
+    width     = default_width,
+    slope     = default_slope,
+    area      = sorted_lengths * default_width,
+    stringsAsFactors = FALSE
+  )
+
+  sorted_geom    <- st_geometry(all_segs[new_order, ])
+  channel_sf_out <- st_sf(channel_df, geometry = sorted_geom)
+  channel_sv_out <- vect(channel_sf_out)
+  crs(channel_sv_out) <- crs(channel_sv)
+
+  # ── 7. Pre-flight validation ──────────────────────────────────────────────────
+  validate_channel_sv(channel_sv_out, verbose = TRUE)
+
+  # ── 8. Run convert_channel ───────────────────────────────────────────────────
+  conv_channel <- convert_channel(
+    channel_sv_out,
+    property_names = c(
+      name      = "name",
+      length    = "length",
+      startNode = "startNode",
+      endNode   = "endNode"
+    ),
+    default_width = default_width,
+    default_slope = default_slope
+  )
+
+  list(
+    channel_sv   = channel_sv_out,
+    channel_df   = channel_df,
+    conv_channel = conv_channel
+  )
+}
+
+
+# =============================================================================
+# Validation: checks the rule as convert_channel sees it
+#   id = startNode; sf_flow_direction = endNode
+#   => endNode must be strictly less than startNode for every non-outlet row
+# =============================================================================
+
+#' Validate a channel SpatVector before passing to convert_channel
+#'
+#' @param sv       SpatVector with startNode, endNode columns.
+#' @param verbose  Print results.
+#' @return Logical TRUE (pass) / FALSE (fail), invisibly.
+
+validate_channel_sv <- function(sv, verbose = TRUE) {
+  df <- as.data.frame(sv)
+
+  outlet_rows <- df$endNode == 0 | !df$endNode %in% df$startNode
+  bad         <- which(!outlet_rows & df$endNode >= df$startNode)
+
+  if (verbose) {
+    message(sprintf(
+      "Segments: %d | Outlet startNode(s): %s | Violations: %d",
+      nrow(df),
+      paste(df$startNode[outlet_rows], collapse=", "),
+      length(bad)
+    ))
+    if (length(bad) > 0) {
+      message("Violations (endNode must be < startNode for non-outlet segments):")
+      print(df[bad, c("name","startNode","endNode")], row.names=FALSE)
+    } else {
+      message("PASS — startNode/endNode ordering is correct for convert_channel and dynatop.")
+    }
+  }
+  invisible(length(bad) == 0)
+}
+
+
+# =============================================================================
+# Usage
+# =============================================================================
+#
+result <- build_dynatop_channel(
+  channel_sv      = test2,
+  split_points_sv = locs,
+  snap_tolerance  = 20,
+  node_tolerance  = 0.01,
+  default_width   = 1,
+  default_slope   = 0.001
+)
+
+# writeVector(
+#   result$conv_channel,
+#   file.path(".", "hb_data", "processed", "channel.shp"),
+#   overwrite = TRUE
+# )
+
+# # Inspect the final table — startNode IS the HRU id, endNode IS sf_flow_direction
+print(result$channel_df)
+plot(result$channel_sv)
+
+plot(st_as_sf(result$channel_sv))
+#
+# # result$conv_channel is already the convert_channel output — use directly:
+# ctch_mdl <- dynatop$new(hru)   # where hru includes result$conv_channel
+#
+# # You can also re-validate at any time:
+ validate_channel_sv(result$channel_sv)
+ 
+ ggplot() +
+  # Plot the raster base map (using factor for discrete colors)
+  geom_spatvector(data = result$channel_sv) +
+  geom_spatvector_text(data = result$channel_sv, aes(label = name))
+  
+  # geom_text(data = centroid_coords[4,], aes(x = x, y = y, label = hru_id), 
+  #           color = "black", fontface = "bold", size = 4) +
+  # Use a nice color palette and remove the bulky legend
+  scale_fill_viridis_d(option = "turbo", na.value = "transparent", guide = "none") +
+  lims(x = c(281500, 281700),
+       y = c(4870400, 4870500))+
+  theme_minimal() +
+  labs(title = "Hubbard Brook HRU & Channel ID Map",
+       subtitle = "Hillslopes (1-20) and Channels (21+)",
+       x = "Longitude", y = "Latitude")
+```
+
+```{r claude channel fixer}
+
+# Function to merge selected names into single row
+merge_segments <- function(names_to_merge, sv_sf, snap_tolerance = 0.1){
+  others   <- sv_sf[!sv_sf$ID %in% names_to_merge, ]
+  to_merge <- sv_sf[ sv_sf$ID %in% names_to_merge, ]
+  
+  # Snap before union to close sub-mm endpoint gaps
+  merged_geom <- st_snap(st_geometry(to_merge),
+                          st_geometry(to_merge),
+                          tolerance = snap_tolerance)
+  
+  # st_line_merge turns connected MULTILINESTRING into single LINESTRING
+  merged_geom <- st_line_merge(st_union(merged_geom))
+  
+  if(st_geometry_type(merged_geom) == "MULTILINESTRING")
+    warning(paste("Segments", paste(names_to_merge, collapse=","),
+                  "did not form a single connected line — check they share endpoints",
+                  "or increase snap_tolerance."))
+  
+  merged_row <- st_sf(ID = names_to_merge[1], geometry = merged_geom)
+  rbind(merged_row, others)
+}
+
+# =============================================================================
+# Helper: split a line at a fractional position along its length
+# Returns a list of two sf lines (upstream part, downstream part)
+# =============================================================================
+split_line_at_fraction <- function(line_sf, frac){
+  # frac in [0,1]: 0 = start, 1 = end of line
+  # Uses lwgeom::st_linesubstring
+  if(frac <= 0 || frac >= 1) return(list(line_sf, line_sf))
+  
+  part1 <- lwgeom::st_linesubstring(line_sf, 0,    frac)
+  part2 <- lwgeom::st_linesubstring(line_sf, frac, 1)
+  list(part1, part2)
+}
+
+# =============================================================================
+# Add this helper inside build_dynatop_channel, after the splitting block
+# and before "── 3. Build coordinate-based node topology ──"
+# =============================================================================
+
+merge_short_segments <- function(all_segs, min_length_m, node_tolerance){
+  
+  # Iteratively merge short segments into their nearest neighbour
+  # until no segments below min_length_m remain
+  max_iter <- 50L
+  
+  for(iter in seq_len(max_iter)){
+    
+    seg_lengths <- as.numeric(st_length(all_segs))
+    short_idx   <- which(seg_lengths < min_length_m)
+    
+    if(length(short_idx) == 0){
+      message(sprintf("  merge_short_segments: done after %d pass(es).", iter - 1))
+      break
+    }
+    
+    message(sprintf("  Pass %d: merging %d segment(s) < %g m.",
+                    iter, length(short_idx), min_length_m))
+    
+    # Process shortest segment first
+    target <- short_idx[which.min(seg_lengths[short_idx])]
+    
+    # Find topologically connected neighbours by shared endpoint
+    precision  <- max(0, ceiling(-log10(node_tolerance)) + 1)
+    
+    get_endpoints <- function(geom){
+      co <- st_coordinates(geom)
+      list(
+        start = round(co[1,        c("X","Y")], precision),
+        end   = round(co[nrow(co), c("X","Y")], precision)
+      )
+    }
+    
+    ep_target <- get_endpoints(all_segs[target, ])
+    
+    # Find segments that share an endpoint with target (excluding itself)
+    neighbours <- c()
+    for(i in seq_len(nrow(all_segs))){
+      if(i == target) next
+      ep_i <- get_endpoints(all_segs[i, ])
+      # Check all four endpoint combinations
+      if(
+        all(abs(ep_i$start - ep_target$start) < node_tolerance) ||
+        all(abs(ep_i$start - ep_target$end)   < node_tolerance) ||
+        all(abs(ep_i$end   - ep_target$start) < node_tolerance) ||
+        all(abs(ep_i$end   - ep_target$end)   < node_tolerance)
+      ){
+        neighbours <- c(neighbours, i)
+      }
+    }
+    
+    if(length(neighbours) == 0){
+      # Isolated segment — remove it (no valid neighbour to merge into)
+      message(sprintf("  Removing isolated segment %d (no connected neighbour).", target))
+      all_segs <- all_segs[-target, ]
+      next
+    }
+    
+    # Prefer merging into the shortest neighbour to keep segments balanced
+    # (avoids creating one giant segment by always merging into the longest)
+    best_neighbour <- neighbours[which.min(seg_lengths[neighbours])]
+    
+    # Merge geometries using st_line_merge(st_union(...)) for clean LINESTRING
+    merged_geom <- st_line_merge(
+      st_union(
+        st_snap(
+          c(st_geometry(all_segs[target, ]),
+            st_geometry(all_segs[best_neighbour, ])),
+          c(st_geometry(all_segs[target, ]),
+            st_geometry(all_segs[best_neighbour, ])),
+          tolerance = node_tolerance * 10
+        )
+      )
+    )
+    
+    if(st_geometry_type(merged_geom) == "MULTILINESTRING"){
+      # Snap tolerance wasn't enough — try larger snap and union
+      merged_geom <- st_line_merge(
+        st_union(st_geometry(all_segs[target, ]),
+                 st_geometry(all_segs[best_neighbour, ]))
+      )
+    }
+    
+    # Replace neighbour row with merged geometry, remove target row
+    all_segs[best_neighbour, ] <- st_sf(geometry = merged_geom)
+    all_segs <- all_segs[-target, ]
+    rownames(all_segs) <- NULL
+  }
+  
+  if(iter == max_iter)
+    warning("merge_short_segments hit max iterations — check for disconnected geometry.")
+  
+  all_segs
+}
+
+# =============================================================================
+# FIXED build_dynatop_channel
+# Key change: split points create a ±buffer_m segment unless bounded by
+# an adjacent split or line endpoint
+# =============================================================================
+
+build_dynatop_channel <- function(
+    channel_sv,
+    split_points_sv,
+    buffer_m       = 5,        # half-length of observation segments (m)
+    min_length_m   = buffer_m * 0.8, # slivers below this are merged
+    snap_tolerance = 1,        # max snap distance for points to line (m)
+    node_tolerance = 0.01,     # coordinate precision for endpoint matching
+    default_width  = 1,
+    default_slope  = 0.001
+){
+  
+  channel_sf <- st_cast(st_as_sf(channel_sv), "LINESTRING")
+  points_sf  <- st_as_sf(split_points_sv)
+  
+  if(st_crs(channel_sf) != st_crs(points_sf)){
+    message("CRS mismatch — reprojecting split points.")
+    points_sf <- st_transform(points_sf, st_crs(channel_sf))
+  }
+  
+  message(sprintf("Input: %d line feature(s), %d split point(s).",
+                  nrow(channel_sf), nrow(points_sf)))
+  
+  # ── 1. Snap split points to nearest position on the channel ──────────────
+  channel_union <- st_union(channel_sf)
+  nearest_segs  <- st_nearest_points(points_sf, channel_union)
+  snapped_pts   <- st_cast(nearest_segs, "POINT")[seq(2, 2*nrow(points_sf), 2)]
+  
+  snap_dists <- as.numeric(st_distance(
+    points_sf,
+    st_sf(geometry = snapped_pts),
+    by_element = TRUE
+  ))
+  far <- which(snap_dists > snap_tolerance)
+  if(length(far) > 0)
+    warning(sprintf("%d point(s) >%g m from channel (rows: %s).",
+                    length(far), snap_tolerance, paste(far, collapse=",")),
+            call.=FALSE)
+  
+  # ── 2. For each line, find which points fall on it and where ─────────────
+  # For each snapped point on a line, compute fractions for:
+  #   frac_pt  — position of the point itself
+  #   frac_lo  — frac_pt - buffer_m/line_length  (or 0 if too close to start)
+  #   frac_hi  — frac_pt + buffer_m/line_length  (or 1 if too close to end)
+  # All fractions for a line are sorted and de-duplicated before splitting.
+  
+  segment_list <- vector("list", nrow(channel_sf))
+  
+  for(i in seq_len(nrow(channel_sf))){
+    this_line    <- channel_sf[i, ]
+    line_length  <- as.numeric(st_length(this_line))
+    
+    dist_to_line <- as.numeric(st_distance(
+      st_sf(geometry = snapped_pts), this_line
+    ))
+    on_this <- which(dist_to_line <= node_tolerance * 10)
+    
+    if(length(on_this) == 0){
+      # No split points on this line — keep as-is
+      segment_list[[i]] <- st_sf(geometry = st_geometry(this_line))
+      next
+    }
+    
+    # Compute fractional positions of each point along this line
+    fracs_all <- c(0, 1)  # always include endpoints
+    
+    for(j in on_this){
+      pt <- snapped_pts[j]
+      
+      # Project point onto line to get distance from start
+      # Use st_nearest_points to find the foot of perpendicular
+      nearest <- st_nearest_points(pt, st_geometry(this_line))
+      foot    <- st_cast(nearest, "POINT")[2]
+      
+      # Distance from line start to foot
+      # Compute by splitting line at foot and measuring first part
+      # Use parameterized position via lwgeom
+      frac_pt <- tryCatch({
+        # Line substring from 0 to foot: measure its length / total length
+        d_from_start <- as.numeric(
+          st_length(lwgeom::st_linesubstring(this_line, 0,
+            # Binary search for fraction — lwgeom doesn't give inverse directly
+            # Use st_line_sample approximation then refine
+            {
+              # Approximate: sample many points, find closest
+              n_samp  <- max(100, ceiling(line_length))
+              fracs_s <- seq(0, 1, length.out = n_samp)
+              samples <- st_line_sample(this_line, sample = fracs_s)
+              samples_pts <- st_cast(samples, "POINT")
+              dists   <- as.numeric(st_distance(foot, samples_pts))
+              fracs_s[which.min(dists)]
+            }
+          ))
+        )
+        d_from_start / line_length
+      }, error = function(e) NA_real_)
+      
+      if(is.na(frac_pt) || frac_pt < 0 || frac_pt > 1) next
+      
+      # ±buffer_m in fractional units, clamped to [0,1]
+      frac_lo <- max(0, frac_pt - buffer_m / line_length)
+      frac_hi <- min(1, frac_pt + buffer_m / line_length)
+      
+      # Only add interior fractions (not already at 0 or 1)
+      if(frac_lo > node_tolerance)             fracs_all <- c(fracs_all, frac_lo)
+      if(frac_hi < 1 - node_tolerance)         fracs_all <- c(fracs_all, frac_hi)
+    }
+    
+    # Sort, deduplicate close fractions, split
+    fracs_all <- sort(unique(fracs_all))
+    fracs_all <- fracs_all[c(TRUE, diff(fracs_all) > node_tolerance / line_length)]
+    
+    # Build sub-segments from consecutive fraction pairs
+    parts <- vector("list", length(fracs_all) - 1)
+    for(k in seq_len(length(fracs_all) - 1)){
+      f1 <- fracs_all[k]
+      f2 <- fracs_all[k + 1]
+      parts[[k]] <- tryCatch(
+        lwgeom::st_linesubstring(this_line, f1, f2),
+        error = function(e){
+          warning(sprintf("st_linesubstring failed on line %d [%.4f, %.4f]", i, f1, f2))
+          NULL
+        }
+      )
+    }
+    
+    parts <- Filter(Negate(is.null), parts)
+    if(length(parts) == 0){
+      segment_list[[i]] <- st_sf(geometry = st_geometry(this_line))
+    } else {
+      geoms <- do.call(c, lapply(parts, st_geometry))
+      segment_list[[i]] <- st_sf(geometry = geoms)
+    }
+  }
+  
+  all_segs <- do.call(rbind, segment_list)
+  rownames(all_segs) <- NULL
+  
+  # Remove degenerate zero-length segments
+  seg_lengths <- as.numeric(st_length(all_segs))
+  all_segs    <- all_segs[seg_lengths > node_tolerance, ]
+  n_segs      <- nrow(all_segs)
+  
+  message(sprintf("After splitting at ±%gm buffers: %d segment(s).", buffer_m, n_segs))
+  
+  
+  
+  # ── 2b. Remove short remnant segments ────────────────────────────────────
+  # min_length_m: segments shorter than this are merged into a neighbour.
+  # Set to slightly less than buffer_m so that genuine sensor segments
+  # (≈ 2*buffer_m = 10m) are never merged away, but slivers are.
+  min_length_m <- buffer_m * 0.8   # e.g. 4m for buffer_m=5
+
+  n_before <- nrow(all_segs)
+  all_segs <- merge_short_segments(all_segs, min_length_m, node_tolerance)
+  n_after  <- nrow(all_segs)
+  
+  message(sprintf("Short segment removal: %d → %d segment(s) (removed %d).",
+                  n_before, n_after, n_before - n_after))
+  
+  
+  # ── 3. Build coordinate-based node topology ───────────────────────────────
+  precision <- max(0, ceiling(-log10(node_tolerance)) + 1)
+  
+  get_endpoints <- function(geom){
+    co <- st_coordinates(geom)
+    rbind(
+      round(co[1,        c("X","Y")], precision),
+      round(co[nrow(co), c("X","Y")], precision)
+    )
+  }
+  
+  ep_matrix   <- do.call(rbind, lapply(seq_len(n_segs),
+                                        function(i) get_endpoints(all_segs[i,])))
+  coord_keys  <- paste(ep_matrix[,"X"], ep_matrix[,"Y"])
+  unique_keys <- unique(coord_keys)
+  node_ids    <- match(coord_keys, unique_keys)
+  start_ids   <- node_ids[seq(1, 2*n_segs, 2)]
+  end_ids     <- node_ids[seq(2, 2*n_segs, 2)]
+  
+  # ── 4. Topological sort — BFS from outlet ─────────────────────────────────
+  sn_to_row <- setNames(seq_len(n_segs), as.character(start_ids))
+  ds        <- unname(sn_to_row[as.character(end_ids)])  # NA = outlet
+  
+  outlets <- which(is.na(ds))
+  if(length(outlets) == 0)
+    stop("No outlet found. Check that lines are directed upstream→downstream.")
+  if(length(outlets) > 1)
+    warning(sprintf("%d outlets detected — network may be disconnected.",
+                    length(outlets)), call.=FALSE)
+  
+  upstream_of <- vector("list", n_segs)
+  for(i in seq_len(n_segs))
+    if(!is.na(ds[i])) upstream_of[[ds[i]]] <- c(upstream_of[[ds[i]]], i)
+  
+  visited   <- logical(n_segs)
+  new_order <- integer(0)
+  queue     <- outlets
+  while(length(queue) > 0){
+    cur <- queue[1]; queue <- queue[-1]
+    if(!visited[cur]){
+      visited[cur] <- TRUE
+      new_order    <- c(new_order, cur)
+      queue        <- c(queue, upstream_of[[cur]])
+    }
+  }
+  
+  unreachable <- setdiff(seq_len(n_segs), new_order)
+  if(length(unreachable) > 0)
+    warning(sprintf("%d segment(s) unreachable from outlet — check network connectivity.",
+                    length(unreachable)), call.=FALSE)
+  
+  n_sorted <- length(new_order)
+  
+  # ── 5. Assign topological ids ─────────────────────────────────────────────
+  topo_id              <- seq_len(n_sorted)
+  sorted_start_orig    <- start_ids[new_order]
+  sorted_end_orig      <- end_ids[new_order]
+  sn_orig_to_sorted    <- setNames(seq_len(n_sorted),
+                                    as.character(sorted_start_orig))
+  ds_sorted            <- unname(sn_orig_to_sorted[as.character(sorted_end_orig)])
+  
+  new_startNode <- topo_id
+  new_endNode   <- ifelse(is.na(ds_sorted), 0L, topo_id[ds_sorted])
+  
+  violations <- which(new_endNode != 0 & new_endNode >= new_startNode)
+  if(length(violations) > 0)
+    stop(sprintf("Topological id violations at sorted rows: %s.",
+                 paste(violations, collapse=", ")))
+  
+  sorted_lengths <- as.numeric(st_length(all_segs[new_order, ]))
+  
+  # ── 6. Assemble output ────────────────────────────────────────────────────
+  channel_df <- data.frame(
+    name      = topo_id,
+    startNode = new_startNode,
+    endNode   = new_endNode,
+    length    = sorted_lengths,
+    width     = default_width,
+    slope     = default_slope,
+    area      = sorted_lengths * default_width,
+    stringsAsFactors = FALSE
+  )
+  
+  sorted_geom    <- st_geometry(all_segs[new_order, ])
+  channel_sf_out <- st_sf(channel_df, geometry = sorted_geom)
+  channel_sv_out <- vect(channel_sf_out)
+  crs(channel_sv_out) <- crs(channel_sv)
+  
+  validate_channel_sv(channel_sv_out, verbose = TRUE)
+  
+  # ── 7. Run convert_channel ────────────────────────────────────────────────
+  conv_channel <- convert_channel(
+    channel_sv_out,
+    property_names = c(
+      name      = "name",
+      length    = "length",
+      startNode = "startNode",
+      endNode   = "endNode"
+    ),
+    default_width = default_width,
+    default_slope = default_slope
+  )
+  
+  list(
+    channel_sv   = channel_sv_out,
+    channel_df   = channel_df,
+    conv_channel = conv_channel
+  )
+}
+
+# =============================================================================
+# Validation helper (unchanged)
+# =============================================================================
+
+validate_channel_sv <- function(sv, verbose = TRUE){
+  df          <- as.data.frame(sv)
+  outlet_rows <- df$endNode == 0 | !df$endNode %in% df$startNode
+  bad         <- which(!outlet_rows & df$endNode >= df$startNode)
+  if(verbose){
+    message(sprintf(
+      "Segments: %d | Outlet startNode(s): %s | Violations: %d",
+      nrow(df),
+      paste(df$startNode[outlet_rows], collapse=", "),
+      length(bad)
+    ))
+    if(length(bad) > 0){
+      message("Violations:")
+      print(df[bad, c("name","startNode","endNode")], row.names=FALSE)
+    } else {
+      message("PASS — ordering correct for convert_channel and dynatop.")
+    }
+  }
+  invisible(length(bad) == 0)
+}
+
+# =============================================================================
+# USAGE — adapt paths and IDs to your watershed
+# =============================================================================
+
+# ── Step 1: Remove non-existent channels ─────────────────────────────────────
+
+locs <- vect(stic_locs_snapped)
+
+## They've been trying to stop the wave, but the wave don't stop
+channel <- vect(w3_streams_vect, crs = crs1) %>% 
+  crop(w3_outline) %>% 
+    mutate(ID = seq(1, n(), 1))
+
+
+ggplot()+
+  geom_spatvector(data = channel)+
+  geom_spatvector_text(data = channel, aes(label = ID))+
+  geom_spatvector(data = locs, color = "blue")
+
+channel_trimmed <- channel %>%
+  filter(!ID %in% c(1,2,8,9,4,14,30,35,45,24,27,16,12))
+# 10 m resolution trimmed: c(1,5,6,4,12,7,23,35,32,41)
+# 3 m resolution trimmed: c(1, 8,9, 12, 19, 4, 39, 25, 15, 2)
+
+ggplot()+
+  geom_spatvector(data = channel_trimmed)+
+  geom_spatvector_text(data = channel_trimmed, aes(label = ID))+
+    geom_spatvector(data = locs, color = "blue")
+# ── Step 2: Convert to sf ────────────────────────────────────────────────────
+sv_sf <- st_as_sf(channel_trimmed %>% select(ID))
+
+# ── Step 3: Merge segments that should be one reach ──────────────────────────
+# IMPORTANT: merge BEFORE renumbering — IDs must exist in sv_sf
+# Use increased snap_tolerance if segments don't share exact endpoints
+
+test <- merge_segments(names_to_merge = c(3,7,6),
+                       sv_sf = sv_sf,
+                       snap_tolerance = 0.1)
+ggplot()+
+  geom_spatvector(data = test)+
+  geom_spatvector_text(data = test, aes(label = ID))+
+    geom_spatvector(data = locs, color = "blue")
+
+vect_final <- vect(test) %>% 
+  # renumber segments
+  mutate(ID = row_number())
+
+ggplot()+
+  geom_spatvector(data = vect_final)+
+  geom_spatvector_text(data = vect_final, aes(label = ID))+
+    geom_spatvector(data = locs, color = "blue")
+
+# ── Step 6: Build channel with observation point splits ──────────────────────
+# split_points_sv  — your STIC/observation locations (already projected)
+# buffer_m = 5     — creates a 10m segment (5m each side) at each location
+#                    unless bounded by an adjacent split or line endpoint
+result <- build_dynatop_channel(
+  channel_sv      = vect_final,
+  split_points_sv = locs,
+  buffer_m        = 5,          # ← 5m either side of observation point
+  min_length_m   = buffer_m * 2,
+  snap_tolerance  = 20,         # max distance to snap obs point to channel
+  node_tolerance  = 0.01,
+  default_width   = 1,
+  default_slope   = 0.001
+)
+
+# ── Step 7: Inspect ───────────────────────────────────────────────────────────
+print(result$channel_df)
+
+ggplot() +
+  geom_sf(data = st_as_sf(result$channel_sv)) +
+    geom_sf(data = locs, color = "blue", size = 2) +
+  geom_sf_text(data = st_as_sf(result$channel_sv), aes(label = name), size = 3) +
+  ggtitle("final channel HRUs")+
+  theme_void()
+ggsave("finalHRUS.png", scale = 3)
+validate_channel_sv(result$channel_sv)
+
+
+```
+
+```{r updated channel creation}
+build_dynatop_channel <- function(
+    channel_sv,
+    split_points_sv,
+    sensor_seg_m   = 10,     # total length of sensor segments (5m each side)
+    fill_seg_m     = 20,     # target length of fill segments between sensors
+    snap_tolerance = 20,     # max distance to snap sensor to network (m)
+    node_tolerance = 0.01,   # endpoint matching precision
+    default_width  = 1,
+    default_slope  = 0.001
+){
+  channel_sf <- st_cast(st_as_sf(channel_sv), "LINESTRING")
+  points_sf  <- st_as_sf(split_points_sv)
+  if(st_crs(channel_sf) != st_crs(points_sf))
+    points_sf <- st_transform(points_sf, st_crs(channel_sf))
+  
+  # ── 1. Dissolve entire network into clean branches ────────────────────────
+  # st_line_merge collapses all connected segments into the minimum number
+  # of LINESTRING pieces — one per unbranched reach
+  network_union  <- st_line_merge(st_union(channel_sf))
+  
+  # Explode MULTILINESTRING into individual branches
+  branches <- st_cast(st_sf(geometry = network_union), "LINESTRING")
+  n_branches <- nrow(branches)
+  message(sprintf("Dissolved to %d branch(es).", n_branches))
+  
+  # ── 2. Snap sensor points to network ─────────────────────────────────────
+  network_geom  <- st_union(branches)
+  nearest_segs  <- st_nearest_points(points_sf, network_geom)
+  snapped_pts   <- st_cast(nearest_segs, "POINT")[seq(2, 2*nrow(points_sf), 2)]
+  snap_dists    <- as.numeric(st_distance(points_sf,
+                                           st_sf(geometry = snapped_pts),
+                                           by_element = TRUE))
+  
+  excluded <- which(snap_dists > snap_tolerance)
+  if(length(excluded) > 0)
+    warning(sprintf("%d sensor(s) >%gm from network — excluded: rows %s",
+                    length(excluded), snap_tolerance,
+                    paste(excluded, collapse=",")))
+  
+  keep       <- which(snap_dists <= snap_tolerance)
+  snapped_pts <- snapped_pts[keep]
+  points_sf   <- points_sf[keep, ]
+  
+  message(sprintf("Snapped %d/%d sensor(s) within %gm.",
+                  length(keep), nrow(points_sf) + length(excluded), snap_tolerance))
+  
+  # ── 3. Re-segment each branch ─────────────────────────────────────────────
+  # For each branch:
+  #   a. Find which snapped sensor points lie on it
+  #   b. Compute their fractional positions along the branch
+  #   c. Define sensor segment boundaries (±half_seg each side, clamped)
+  #   d. Fill gaps with equal-length segments of ≈fill_seg_m
+  
+  half_seg <- sensor_seg_m / 2
+  
+  segment_geoms  <- vector("list", n_branches)
+  segment_labels <- vector("list", n_branches)  # "sensor" or "fill"
+  sensor_idx_map <- vector("list", n_branches)  # which sensor_id per segment
+  
+  for(b in seq_len(n_branches)){
+    branch      <- branches[b, ]
+    branch_len  <- as.numeric(st_length(branch))
+    
+    # Find sensors on this branch
+    dist_to_branch <- as.numeric(st_distance(
+      st_sf(geometry = snapped_pts), branch
+    ))
+    on_branch <- which(dist_to_branch <= node_tolerance * 100)
+    
+    # Compute fractional position of each sensor along the branch
+    # using dense sampling for accuracy
+    n_samp   <- max(1000L, ceiling(branch_len * 20))
+    fracs_s  <- seq(0, 1, length.out = n_samp)
+    samples  <- st_cast(st_line_sample(branch, sample = fracs_s), "POINT")
+    samp_sfc <- st_sfc(samples, crs = st_crs(branch))
+    
+    sensor_fracs <- numeric(0)
+    sensor_ids   <- integer(0)
+    
+    for(j in on_branch){
+      dists    <- as.numeric(st_distance(snapped_pts[j], samp_sfc))
+      frac_pt  <- fracs_s[which.min(dists)]
+      sensor_fracs <- c(sensor_fracs, frac_pt)
+      sensor_ids   <- c(sensor_ids, j)
+    }
+    
+    # Sort sensors by position along branch (upstream to downstream)
+    if(length(sensor_fracs) > 0){
+      ord          <- order(sensor_fracs)
+      sensor_fracs <- sensor_fracs[ord]
+      sensor_ids   <- sensor_ids[ord]
+    }
+    
+    # Build split fraction list:
+    # For each sensor: add (frac_center - half/len) and (frac_center + half/len)
+    # For remaining gaps: divide equally into chunks of ≈fill_seg_m
+    
+    all_fracs  <- c(0)
+    frac_types <- character(0)  # will label each resulting segment
+    seg_sensor <- integer(0)    # sensor index for sensor segments (NA for fill)
+    
+    # Process intervals: [prev_boundary, next_sensor_lo], sensor seg, [sensor_hi, ...]
+    prev_frac <- 0
+    
+    for(k in seq_along(sensor_fracs)){
+      sf_k  <- sensor_fracs[k]
+      flo_k <- max(0, sf_k - half_seg / branch_len)
+      fhi_k <- min(1, sf_k + half_seg / branch_len)
+      
+      # Gap before this sensor
+      gap_len <- (flo_k - prev_frac) * branch_len
+      if(gap_len > node_tolerance){
+        # Divide gap into equal fill segments
+        n_fill <- max(1L, round(gap_len / fill_seg_m))
+        fill_fracs <- seq(prev_frac, flo_k, length.out = n_fill + 1)
+        all_fracs  <- c(all_fracs, fill_fracs[-1])  # exclude left (already added)
+      }
+      
+      # Sensor segment boundaries
+      all_fracs  <- c(all_fracs, fhi_k)
+      prev_frac  <- fhi_k
+    }
+    
+    # Remaining gap after last sensor (or entire branch if no sensors)
+    gap_len <- (1 - prev_frac) * branch_len
+    if(gap_len > node_tolerance){
+      n_fill     <- max(1L, round(gap_len / fill_seg_m))
+      fill_fracs <- seq(prev_frac, 1, length.out = n_fill + 1)
+      all_fracs  <- c(all_fracs, fill_fracs[-1])
+    }
+    
+    # Ensure 1 is included and fracs are sorted/unique
+    all_fracs <- sort(unique(c(all_fracs, 1)))
+    # Remove fracs that are too close (would create degenerate segments)
+    min_frac_gap <- (node_tolerance * 2) / branch_len
+    keep_fracs   <- c(TRUE, diff(all_fracs) > min_frac_gap)
+    all_fracs    <- all_fracs[keep_fracs]
+    if(tail(all_fracs, 1) < 1) all_fracs <- c(all_fracs, 1)
+    
+    # Build sub-segment geometries and label them
+    segs      <- vector("list", length(all_fracs) - 1)
+    seg_type  <- character(length(all_fracs) - 1)
+    seg_sid   <- rep(NA_integer_, length(all_fracs) - 1)
+    
+    for(k in seq_len(length(all_fracs) - 1)){
+      f1 <- all_fracs[k]
+      f2 <- all_fracs[k + 1]
+      
+      geom <- tryCatch(
+        lwgeom::st_linesubstring(branch, f1, f2),
+        error = function(e) NULL
+      )
+      segs[[k]] <- geom
+      
+      # Label as sensor if midpoint fraction is inside a sensor window
+      mid_frac <- (f1 + f2) / 2
+      is_sensor <- FALSE
+      for(j in seq_along(sensor_fracs)){
+        flo <- max(0, sensor_fracs[j] - half_seg / branch_len)
+        fhi <- min(1, sensor_fracs[j] + half_seg / branch_len)
+        if(mid_frac >= flo && mid_frac <= fhi){
+          is_sensor  <- TRUE
+          seg_sid[k] <- sensor_ids[j]
+          break
+        }
+      }
+      seg_type[k] <- if(is_sensor) "sensor" else "fill"
+    }
+    
+    valid           <- !sapply(segs, is.null)
+    segment_geoms[[b]]  <- segs[valid]
+    segment_labels[[b]] <- seg_type[valid]
+    sensor_idx_map[[b]] <- seg_sid[valid]
+  }
+  
+  # ── 4. Assemble all segments into one sf object ───────────────────────────
+  all_geom_list <- do.call(c, segment_geoms)
+  all_types     <- do.call(c, segment_labels)
+  all_sensor_ids <- do.call(c, sensor_idx_map)
+  
+  # Remove null or zero-length results
+  valid_geom  <- !sapply(all_geom_list, is.null)
+  all_geom_list  <- all_geom_list[valid_geom]
+  all_types      <- all_types[valid_geom]
+  all_sensor_ids <- all_sensor_ids[valid_geom]
+  
+  all_segs <- st_sf(
+    type       = all_types,
+    sensor_idx = all_sensor_ids,
+    geometry   = do.call(c, lapply(all_geom_list, st_geometry)),
+    crs        = st_crs(channel_sf)
+  )
+  
+  seg_lengths_m <- as.numeric(st_length(all_segs))
+  all_segs      <- all_segs[seg_lengths_m > node_tolerance, ]
+  
+  message(sprintf("Created %d segments (%d sensor, %d fill).",
+                  nrow(all_segs),
+                  sum(all_segs$type == "sensor"),
+                  sum(all_segs$type == "fill")))
+  
+  # ── 5. Build topology (same as before) ────────────────────────────────────
+  precision <- max(0, ceiling(-log10(node_tolerance)) + 1)
+  n_segs    <- nrow(all_segs)
+  
+  get_endpoints <- function(geom){
+    co <- st_coordinates(geom)
+    rbind(round(co[1,        c("X","Y")], precision),
+          round(co[nrow(co), c("X","Y")], precision))
+  }
+  
+  ep_matrix   <- do.call(rbind, lapply(seq_len(n_segs),
+                                        function(i) get_endpoints(all_segs[i,])))
+  coord_keys  <- paste(ep_matrix[,"X"], ep_matrix[,"Y"])
+  unique_keys <- unique(coord_keys)
+  node_ids    <- match(coord_keys, unique_keys)
+  start_ids   <- node_ids[seq(1, 2*n_segs, 2)]
+  end_ids     <- node_ids[seq(2, 2*n_segs, 2)]
+  
+  sn_to_row <- setNames(seq_len(n_segs), as.character(start_ids))
+  ds        <- unname(sn_to_row[as.character(end_ids)])
+  outlets   <- which(is.na(ds))
+  
+  if(length(outlets) == 0) stop("No outlet found.")
+  if(length(outlets) > 1)
+    warning(sprintf("%d outlets — network may be disconnected.", length(outlets)))
+  
+  upstream_of <- vector("list", n_segs)
+  for(i in seq_len(n_segs))
+    if(!is.na(ds[i])) upstream_of[[ds[i]]] <- c(upstream_of[[ds[i]]], i)
+  
+  visited <- logical(n_segs); new_order <- integer(0); queue <- outlets
+  while(length(queue) > 0){
+    cur <- queue[1]; queue <- queue[-1]
+    if(!visited[cur]){
+      visited[cur] <- TRUE
+      new_order    <- c(new_order, cur)
+      queue        <- c(queue, upstream_of[[cur]])
+    }
+  }
+  
+  unreachable <- setdiff(seq_len(n_segs), new_order)
+  if(length(unreachable) > 0)
+    warning(sprintf("%d unreachable segment(s).", length(unreachable)))
+  
+  n_sorted          <- length(new_order)
+  topo_id           <- seq_len(n_sorted)
+  sorted_start_orig <- start_ids[new_order]
+  sorted_end_orig   <- end_ids[new_order]
+  sn_orig_to_sorted <- setNames(seq_len(n_sorted), as.character(sorted_start_orig))
+  ds_sorted         <- unname(sn_orig_to_sorted[as.character(sorted_end_orig)])
+  new_startNode     <- topo_id
+  new_endNode       <- ifelse(is.na(ds_sorted), 0L, topo_id[ds_sorted])
+  
+  violations <- which(new_endNode != 0 & new_endNode >= new_startNode)
+  if(length(violations) > 0)
+    stop(sprintf("Topology violations at rows: %s", paste(violations, collapse=",")))
+  
+  sorted_lengths <- as.numeric(st_length(all_segs[new_order, ]))
+  sorted_types   <- all_segs$type[new_order]
+  sorted_sensors <- all_segs$sensor_idx[new_order]
+  
+  # ── 6. Assemble output ────────────────────────────────────────────────────
+  channel_df <- data.frame(
+    name        = topo_id,
+    startNode   = new_startNode,
+    endNode     = new_endNode,
+    length      = sorted_lengths,
+    width       = default_width,
+    slope       = default_slope,
+    area        = sorted_lengths * default_width,
+    type        = sorted_types,
+    sensor_idx  = sorted_sensors,
+    stringsAsFactors = FALSE
+  )
+  
+  sorted_geom    <- st_geometry(all_segs[new_order, ])
+  channel_sf_out <- st_sf(channel_df, geometry = sorted_geom)
+  channel_sv_out <- vect(channel_sf_out)
+  crs(channel_sv_out) <- crs(channel_sv)
+  
+  validate_channel_sv(channel_sv_out, verbose = TRUE)
+  
+  conv_channel <- convert_channel(
+    channel_sv_out,
+    property_names = c(name="name", length="length",
+                       startNode="startNode", endNode="endNode"),
+    default_width = default_width,
+    default_slope = default_slope
+  )
+  
+  # ── 7. Sensor-to-HRU mapping ──────────────────────────────────────────────
+  id_col <- intersect(c("number","ID","id","sensor_id","name"), names(points_sf))[1]
+  
+  sensor_map <- data.frame(
+    sensor_id  = if(!is.na(id_col)) points_sf[[id_col]] else seq_len(nrow(points_sf)),
+    sensor_idx = seq_along(keep),
+    stringsAsFactors = FALSE
+  )
+  
+  hru_map <- channel_df %>%
+    filter(type == "sensor", !is.na(sensor_idx)) %>%
+    left_join(sensor_map, by = "sensor_idx") %>%
+    select(sensor_id, hru_id = name, hru_length = length)
+  
+  list(
+    channel_sv   = channel_sv_out,
+    channel_df   = channel_df,
+    conv_channel = conv_channel,
+    sensor_hru_map = hru_map
+  )
+}
+
+result <- build_dynatop_channel(
+  channel_sv      = vect_final,
+  split_points_sv = locs,
+  sensor_seg_m    = 10,   # 10m total per sensor (5m each side)
+  fill_seg_m      = 100,   # remaining network in ~20m chunks
+  snap_tolerance  = 20,
+  node_tolerance  = 0.01
+)
+
+ggplot() +
+  geom_sf(data = st_as_sf(result$channel_sv)) +
+    geom_sf(data = locs, color = "blue", size = 2) +
+  geom_sf_text(data = st_as_sf(result$channel_sv), aes(label = name), size = 3) +
+  ggtitle("final channel HRUs")+
+  theme_void()
+# Sensor-to-HRU mapping is now returned directly
+sensor_hru_map <- result$sensor_hru_map
+print(sensor_hru_map)
+
+# Inspect segment types
+table(result$channel_df$type)
+
+
+writeVector(
+  result$conv_channel,
+  paste0(processed_folder, "channel.shp"),
+  overwrite = TRUE
+)
+
+  plot(result$conv_channel)
+
+```
+
+
+```{r identify ID to hru ID}
+# =============================================================================
+# Extract sensor-to-HRU mapping from build_dynatop_channel result
+# =============================================================================
+get_sensor_hru_map <- function(channel_sv, split_points_sv, 
+                                buffer_m = 5,
+                                node_tolerance = 0.01){
+  
+  channel_sf <- st_as_sf(channel_sv)
+  points_sf  <- st_as_sf(split_points_sv)
+  
+  if(st_crs(channel_sf) != st_crs(points_sf))
+    points_sf <- st_transform(points_sf, st_crs(channel_sf))
+  
+  # Snap points to channel (same logic as build_dynatop_channel)
+  channel_union <- st_union(channel_sf)
+  nearest_segs  <- st_nearest_points(points_sf, channel_union)
+  snapped_pts   <- st_cast(nearest_segs, "POINT")[seq(2, 2*nrow(points_sf), 2)]
+  
+  # For each snapped point, find which channel segment it falls within
+  # A sensor's segment is the one whose midpoint is closest to the snapped point
+  # AND whose length is <= 2*buffer_m + small tolerance (i.e. it's a split segment)
+  seg_lengths   <- as.numeric(st_length(channel_sf))
+  seg_midpoints <- st_centroid(channel_sf)
+  
+  mapping <- do.call(rbind, lapply(seq_len(nrow(points_sf)), function(i){
+    
+    pt <- snapped_pts[i]
+    
+    # Distance from snapped point to each segment midpoint
+    dists <- as.numeric(st_distance(pt, seg_midpoints))
+    
+    # Candidate segments: those short enough to be a sensor segment
+    # (length <= 2*buffer_m + tolerance) AND closest to the snapped point
+    is_sensor_seg <- seg_lengths <= (2 * buffer_m + 1)  # 1m tolerance
+    
+    if(any(is_sensor_seg)){
+      # Among sensor-length segments, pick closest midpoint
+      candidate_dists <- ifelse(is_sensor_seg, dists, Inf)
+      best_idx <- which.min(candidate_dists)
+    } else {
+      # Fallback: just pick closest segment overall
+      best_idx <- which.min(dists)
+    }
+    
+    # Get sensor ID from the split_points_sv attribute
+    # Tries common ID column names — adapt if yours differs
+    id_cols <- c("number", "ID", "id", "sensor_id", "name", "sensor_name")
+    id_col  <- id_cols[id_cols %in% names(points_sf)][1]
+    sensor_id <- if(!is.na(id_col)) points_sf[[id_col]][i] else i
+    
+    data.frame(
+      sensor_id  = sensor_id,
+      hru_id     = channel_sf$startNode[best_idx],  # startNode IS the HRU id
+      hru_name   = channel_sf$name[best_idx],
+      seg_length = round(seg_lengths[best_idx], 2),
+      snap_dist  = round(as.numeric(st_distance(
+                     points_sf[i,], st_sf(geometry = snapped_pts[i])
+                   )), 2),
+      stringsAsFactors = FALSE
+    )
+  }))
+  
+  rownames(mapping) <- NULL
+  return(mapping)
+}
+
+# ── Usage ─────────────────────────────────────────────────────────────────────
+locs <- vect(stic_locs_snapped)
+
+vect_final <- vect("./5th_attempt/processed/channel.shp")
+plot(vect_final)
+
+ggplot() +
+  geom_sf(data = st_as_sf(vect_final)) +
+    geom_sf(data = locs, color = "blue", size = 2) +
+  geom_sf_text(data = st_as_sf(vect_final), aes(label = name), size = 3) +
+  ggtitle("final channel HRUs")+
+  theme_void()
+
+sensor_hru_map <- get_sensor_hru_map(
+  channel_sv          = vect_final,
+  split_points_sv = locs,
+  buffer_m        = 5
+)
+
+
+print(sensor_hru_map)
+sensor_hru_map$sensor_id <- as.numeric(sensor_hru_map$sensor_id)
+#   sensor_id  hru_id  hru_name  seg_length  snap_dist
+# 1        A1       4         4        9.87       0.31
+# 2        B3      12        12       10.00       0.02
+# ...
+
+# Save for use in pa_obs construction
+write.csv(sensor_hru_map, "sensor_hru_mapping.csv", row.names = FALSE)
+
+# Use directly in pa_obs remapping instead of the distance-based approach
+# Replace the left_join(chosen, ...) step with:
+# pa_obs <- all_24 %>%
+#   filter(wshed == "W3", number %in% sensor_hru_map$sensor_id) %>%
+#   left_join(sensor_hru_map, by = c("number" = "sensor_id")) %>%
+#   mutate(hru_id = hru_id, ...)
+```
+
+
+
+# TIMESERIES
+```{r}
+start <- "2020-01-01"
+end <- "2024-11-26"
+```
+
+```{r discharge}
+
+
+# discharge every 15 mins
+flow_15min <- read_csv("https://pasta.lternet.edu/package/data/eml/knb-lter-hbr/1/18/1b101627265d0b5763fa0bba93d93bf7") 
+q_24 <- read_csv("/Users/johnmorgan/Documents/VT Research/HBTopModel/w3_discharge_24.csv") %>% 
+  mutate(datetime = mdy_hm(datetime)) %>% 
+  filter(datetime > max(flow_15min$DATETIME)) %>% 
+  mutate(WS = 3,
+         Flag = "P",
+         Discharge_ls = 28.3168 * Q_cfs) %>% 
+  rename(DATETIME = datetime) %>% 
+  select(WS, DATETIME, Discharge_ls, Flag)
+  
+
+flow_xts <- 
+  flow_15min %>%
+  rbind(q_24) %>% 
+  filter(DATETIME >= start,
+         DATETIME <= end) %>% 
+  # Create a new column that groups time into 15-minute buckets
+  mutate(time_15 = floor_date(DATETIME, "15 mins")) %>%
+  # Group by those buckets
+  group_by(time_15) %>%
+  # Average the 5-minute instantaneous rates to get the 15-minute rate
+  summarize(Discharge_ls = mean(Discharge_ls, na.rm = TRUE)) %>%
+  # convert to m3_s, or should it be m3/day?>
+  mutate(Discharge_m3_s = Discharge_ls / 1000) %>% 
+  as.xts()
+
+flow_xts <- 
+  flow_15min %>%
+  rbind(q_24) %>% 
+  filter(DATETIME >= start,
+         DATETIME <= end) %>% 
+  # Create a new column that groups time into 15-minute buckets
+  mutate(time_hr = floor_date(DATETIME, "1 hour")) %>%
+  # Group by those buckets
+  group_by(time_hr) %>%
+  # Average the 5-minute instantaneous rates to get the 15-minute rate
+  summarize(Discharge_ls = mean(Discharge_ls, na.rm = TRUE)) %>%
+  # convert to m3_s, or should it be m3/day?>
+  mutate(Discharge_m3_s = Discharge_ls / 1000) %>% 
+  as.xts()
+
+```
+Units of precipitation and pet are expected to be m accrued over the previous timestep.
+```{r precipitation}
+precip <- read_csv("https://pasta.lternet.edu/package/data/eml/knb-lter-hbr/278/7/132ffe0622ff3f30505c774d24a6b65d")
+# precip in mm accrued over timestep, needs to be m accrued over time step
+
+precip_xts <- 
+  precip %>% 
+  filter(DateTime >= start,
+         DateTime <= end) %>% 
+  select(DateTime, precip) %>% 
+  mutate(precip = precip / 1000) %>% # convert to m
+  # Create a new column that groups time into 15-minute buckets
+  mutate(time_hr = floor_date(DateTime, "1 hour")) %>%
+  # Group by those buckets
+  group_by(time_hr) %>%
+  # Average the 5-minute instantaneous rates to get the 15-minute rate
+  summarize(precip = sum(precip, na.rm = TRUE)) %>%
+  as.xts()
+```
+```{r pet}
+# air temp already 15 min increment
+air <- read_csv("https://pasta.lternet.edu/package/data/eml/knb-lter-hbr/322/7/a96172a26f381b9ec7005144d12e0820")
+
+air_formatted <- air %>% 
+  filter(DateTime >= start,
+         DateTime <= end) %>% 
+  select(DateTime, airTemp) 
+
+# convert airTemp to pet with hargreaves
+
+lat <- 45   # latitude in decimal degrees (e.g., Blacksburg VA)
+
+# --- Hargreaves PET -----------------------------------------------------
+
+hargreaves_pet <- function(date, temp, lat){
+
+  J <- yday(date)                 # day of year
+  phi <- lat * pi/180             # latitude radians
+  
+  # extraterrestrial radiation (Ra)
+  dr  <- 1 + 0.033*cos(2*pi*J/365)
+  delta <- 0.409*sin(2*pi*J/365 - 1.39)
+  ws <- acos(-tan(phi)*tan(delta))
+
+  Gsc <- 0.0820   # MJ m-2 min-1
+  
+  Ra <- (24*60/pi) * Gsc * dr *
+        (ws*sin(phi)*sin(delta) +
+         cos(phi)*cos(delta)*sin(ws))
+
+  PET <- 0.0023 * Ra *
+         (temp + 17.8) *
+         sqrt(pmax(temp, 0))
+
+  return(PET)   # mm/day
+}
+
+# --- Calculate PET ------------------------------------------------------
+
+air_formatted$PET_mm_day <- hargreaves_pet(
+  air_formatted$DateTime,
+  air_formatted$airTemp,
+  lat
+)
+
+
+pet_xts <- 
+  air_formatted %>% 
+  select(DateTime, PET_mm_day, airTemp) %>% 
+  mutate(PET_m_day = PET_mm_day / (1000 * 96)) %>% # convert to m, and 15 min
+  rename(pet = PET_m_day) %>% 
+  # Create a new column that groups time into 15-minute buckets
+  mutate(time_hr = floor_date(DateTime, "1 hour")) %>%
+  # Group by those buckets
+  group_by(time_hr) %>%
+  # Average the 5-minute instantaneous rates to get the 15-minute rate
+  summarize(pet = mean(pet, na.rm = TRUE),
+            airTemp = mean(airTemp, na.rm = TRUE)) %>%
+  #select() %>% 
+  as.xts()
+
+ 
+```
+```{r combine}
+
+obs <- merge(flow_xts[,2], # flow does not go beyond 2024-05-31 23:45:00
+             precip_xts,
+             pet_xts,
+             all=FALSE) ## merge by time stamp
+#obs <- obs[ , colSums(is.na(obs)) == 0]               # Remove columns with at least one NA
+
+# Save it
+saveRDS(obs, file.path(".", "hb_data", "processed", "obs.rds"))
+
+
+
+#saveRDS(obs, file.path(".", "processed", "obs.rds"))
+```
+
+# CREATE DYNATOP OBJECT
+```{r create object}
+#devtools::install_github("waternumbers/dynatopGIS")
+#library(dynatopGIS)
+
+ctch <- dynatopGIS$new(file.path(".", "dynaGISgoodChannel6"))
+# add catchment, DEM, channel
+ctch$add_catchment(paste0(processed_folder, "w3.tif"))
+ctch$add_dem(paste0(processed_folder, "dem.tif"))
+ctch$add_channel( paste0(processed_folder, "channel.shp"))
+
+ctch$get_layer()
+
+# plot just to check it out!
+ctch$plot_layer("dem", add_channel=TRUE)
+```
+
+```{r fill-sinks}
+ctch$sink_fill()
+
+terra::plot( ctch$get_layer('filled_dem') - ctch$get_layer('dem'),
+             main="Changes to height")
+```
+
+```{r compute-stuff}
+# bands
+ctch$compute_band()
+ctch$plot_layer("band")
+# twi
+ctch$compute_properties()
+ctch$plot_layer('atb')
+# flow lengths
+ctch$compute_flow_lengths(flow_routing="shortest")
+ctch$plot_layer("shortest_flow_length")
+```
+
+```{r bring in other datasets}
+
+# soil map
+soil <- terra::rast("https://pasta.lternet.edu/package/data/eml/knb-lter-hbr/380/2/f083871fa0116b17b7398ca48eac7627")
+soil_factor <- as.factor(soil)
+
+soil_r  <- resample(project(soil_factor, dem_crop_mask), dem_crop_mask, method="mode")
+
+crop_soil <- crop(soil_r, dem_crop_mask)
+mask_soil <- mask(soil_r, dem_crop_mask)
+plot(mask_soil)
+
+
+key <- read_csv("/Users/johnmorgan/Documents/soil_depth_planning/HPU_num_key.csv")
+
+
+levels(mask_soil) <- data.frame(
+  "ID" = c(
+    5, 4, 2, 8, 3, 1, 6, 7
+  ),
+  "f083871fa0116b17b7398ca48eac7627" = c(
+  "5"," 4"," 2", "8", "3", "1", "6", "7")
+)
+
+colors <- c("black",
+            "#CCCCCC",
+            "#734C00",
+            "#FFFF73",
+            "#267300",
+            "#55FF00",
+            "black"
+            )
+soil_names <- c(
+  "Bedrock Histosol",
+  "E",
+  "Bhs",
+  "Typical",
+  "Bimodal",
+  "Bh"
+)
+ggplot() +
+    geom_spatraster(data = (mask_soil))+
+scale_fill_manual(values = colors,
+                  labels = soil_names,
+                  na.value = NA)+
+  theme_void()+
+      geom_sf(data = w3_outline, colour = "black", lwd = 1, fill = NA) +
+  labs(title = "1 m overburden thickness contours")
+
+
+
+# read in krig of depth to bedrock
+krig_location <- "/Users/johnmorgan/Documents/soil_depth_planning/krig_output.tif"
+k_terra <- rast(krig_location)
+plot(k_terra)
+
+# resample to the same pixel size and alignment
+depth  <- resample(project(k_terra, dem_crop_mask), dem_crop_mask, method="bilinear") %>% 
+  crop(dem_crop_mask) %>% 
+  mask(dem_crop_mask)
+
+# check all of their extents
+plot(dem_crop_mask)
+plot(depth)
+plot(mask_soil)
+
+
+# extend both rasters by 1 pixel
+depth_ext <- extend(depth,1)
+soil_ext <- extend(mask_soil,1)
+
+# check all of their extents
+plot(depth_ext)
+plot(soil_ext)
+#ctch$plot_layer("dem", add_channel=TRUE)
+
+reclass_matrix <- matrix(c(1, 1,
+                           2, 3,
+                           3, 2,
+                           4, 3,
+                           5, 3,
+                           7, 3,
+                           8, 2), 
+                         ncol = 2, byrow = TRUE)
+
+# Apply classification
+soil_ext <- classify(soil_ext, reclass_matrix)
+plot(soil_ext)
+
+
+ctch$add_layer(depth_ext, layer_name = "depth")
+ctch$add_layer(soil_ext, layer_name = "soil")
+ctch$classify("depth_5","depth",5)
+ctch$plot_layer("depth_5")
+
+```
+
+
+```{r classifying and cutting}
+## simple equally spaced cuts of TWI
+ctch$classify("atb_20","atb",20)
+ctch$plot_layer("atb_20")
+
+ctch$combine_classes("atb20_soil",c("atb_20","soil"))
+ctch$plot_layer("atb20_soil")
+
+tmp <- ctch$get_method("atb20_soil")
+tmp$type
+#> [1] "combination"
+length(tmp$groups$atb5_depth5_soil_band)
+```
+
+```{r create the model}
+ctch$create_model(file.path("./dynaGISgoodChannel6","model"), # name of new model
+                  "atb20_soil", # classification to base model on
+                  sf_opt="cnst",
+                  sz_opt="exp"
+                  )
+
+## load the model
+mdl <- readRDS( file.path(".","dynaGISgoodChannel6","model.rds")) ## read the model in
+obs <- readRDS(file.path(".", "hb_data", "processed", "obs.rds"))
+vect_final <- vect("./5th_attempt/processed/channel.shp")
+
+names(obs) <- c("Discharge_m3_s", "precip","pet","temp_series" )
+```
+
+```{r fix hru topology}
+fix_hru_topology <- function(mdl, verbose = TRUE){
+  hru <- mdl$hru
+  
+  # ── Rename helper — updates id AND all references ────────────────────────
+  rename_hru <- function(hru, old_id, new_id){
+    for(ii in seq_along(hru)){
+      if(hru[[ii]]$id == old_id) hru[[ii]]$id <- new_id
+      hru[[ii]]$sf_flow_direction$id[
+        hru[[ii]]$sf_flow_direction$id == old_id] <- new_id
+      hru[[ii]]$sz_flow_direction$id[
+        hru[[ii]]$sz_flow_direction$id == old_id] <- new_id
+    }
+    return(hru)
+  }
+  
+  # ── Find violations ───────────────────────────────────────────────────────
+  find_violations <- function(hru){
+    out <- do.call(rbind, lapply(seq_along(hru), function(ii){
+      h      <- hru[[ii]]
+      bad_sf <- h$sf_flow_direction$id[h$sf_flow_direction$id >= h$id]
+      bad_sz <- h$sz_flow_direction$id[h$sz_flow_direction$id >= h$id]
+      if(length(bad_sf) > 0 || length(bad_sz) > 0)
+        data.frame(hru_id  = h$id,
+                   max_bad = max(c(bad_sf, bad_sz)),
+                   stringsAsFactors = FALSE)
+    }))
+    out
+  }
+  
+  # ── Iterative fix ─────────────────────────────────────────────────────────
+  # Strategy: find HRU X that flows to Y where Y >= X.
+  # X must have id > Y (and > everything else X flows to).
+  # New id for X = max(all downstream ids of X) + 1.
+  # Every HRU currently occupying ids between old_X and new_X shifts down by 1
+  # to keep the sequence contiguous.
+  
+  tmp_id  <- 9999L  # safe scratch id above any real id
+  max_iter <- 50L
+  
+  for(iter in seq_len(max_iter)){
+    violations <- find_violations(hru)
+    if(is.null(violations) || nrow(violations) == 0){
+      if(verbose) cat(sprintf("All violations resolved after %d iteration(s).\n",
+                              iter - 1))
+      break
+    }
+    if(verbose){
+      cat(sprintf("Iteration %d — violations:\n", iter))
+      print(violations)
+    }
+    
+    # Fix the first violation
+    v      <- violations[1, ]
+    hru_id <- v$hru_id
+    
+    # Collect ALL downstream ids for this HRU (sf and sz)
+    ii      <- which(sapply(hru, function(h) h$id == hru_id))
+    all_dst <- c(hru[[ii]]$sf_flow_direction$id,
+                 hru[[ii]]$sz_flow_direction$id)
+    all_dst <- all_dst[!is.na(all_dst) & length(all_dst) > 0]
+    
+    # New id must be strictly above all downstream ids
+    new_id  <- max(all_dst) + 1L
+    old_id  <- hru_id
+    
+    if(verbose)
+      cat(sprintf("  Moving HRU %d -> %d (flows to: %s)\n",
+                  old_id, new_id, paste(all_dst, collapse=",")))
+    
+    # Step 1: park the offending HRU at tmp_id
+    hru <- rename_hru(hru, old_id, tmp_id)
+    
+    # Step 2: shift every HRU with id in (old_id, new_id] down by 1
+    # Do this from lowest to highest to avoid collisions
+    ids_to_shift <- sort(sapply(hru, function(h) h$id))
+    ids_to_shift <- ids_to_shift[ids_to_shift > old_id &
+                                   ids_to_shift <= new_id &
+                                   ids_to_shift != tmp_id]
+    
+    for(shift_id in ids_to_shift){
+      hru <- rename_hru(hru, shift_id, shift_id - 1L)
+    }
+    
+    # Step 3: move parked HRU from tmp_id to new_id
+    hru <- rename_hru(hru, tmp_id, new_id)
+  }
+  
+  if(iter == max_iter){
+    remaining <- find_violations(hru)
+    if(!is.null(remaining) && nrow(remaining) > 0){
+      warning("Could not resolve all violations after ", max_iter,
+              " iterations. Remaining:\n")
+      print(remaining)
+      cat("This may indicate a cycle in the channel network.\n")
+    }
+  }
+  
+  # ── Verify contiguous sequence ────────────────────────────────────────────
+  final_ids <- sort(sapply(hru, function(h) h$id))
+  expected  <- seq(min(final_ids), max(final_ids))
+  gaps      <- setdiff(expected, final_ids)
+  if(length(gaps) > 0){
+    warning("Gaps in id sequence after fix: ", paste(gaps, collapse=", "))
+  } else {
+    if(verbose) cat("ID sequence contiguous: OK\n")
+  }
+  
+  mdl$hru <- hru
+  return(mdl)
+}
+
+mdl <- fix_hru_topology(mdl = mdl, verbose = TRUE)
+```
+
+```{r}
+# actually need to figure out which HRU in final model corresponds with sensor location
+
+# write function to filter HRU object for HRU's with a specific class name.
+sensor_hru_map
+mdl$hru[[1]]$class$name
+
+hid <- sapply(mdl$hru,function(h){h$id})
+## create a vector of the channel names with as storaged in the class variabel
+cname <- sapply(mdl$hru,function(h){h$class$name})
+idx <- match(sensor_hru_map$hru_name,cname) ## index of HRU's corresponding to gauges
+## create as a data.frame
+sensor_hru_key <- data.frame(sensor_id = sensor_hru_map$sensor_id,
+           hru_id = as.integer(hid[idx]),
+           name = sensor_hru_map$hru_name
+                           )
+```
+
+```{r identify soil groups}
+# =============================================================================
+# EXTRACT SOIL GROUPS FOR HILLSLOPE HRUs
+# =============================================================================
+# Assuming 'soil' was used to generate your HRU classes and is stored in $class
+# You may need to change `h$class$soil` to wherever your class name is stored 
+# (e.g., h$properties["soil"] or similar).
+
+hru_soil_map <- lapply(seq_along(mdl$hru), function(ii) {
+  h <- mdl$hru[[ii]]
+  is_channel <- !is.na(h$class$endNode)
+  
+  if (!is_channel) {
+    # CHANGE THIS to the exact location of your soil identifier
+    soil_id <- as.character(h$class$soil) 
+    data.frame(hru_index = ii, hru_id = h$id, soil_group = soil_id)
+  } else {
+    NULL
+  }
+})
+
+hru_soil_map <- do.call(rbind, hru_soil_map)
+
+# Map the raw soil names/IDs to a simple index (1, 2, 3) for parameter matching
+unique_soils <- unique(hru_soil_map$soil_group)
+hru_soil_map$soil_idx <- match(hru_soil_map$soil_group, unique_soils)
+
+cat("Found", length(unique_soils), "soil groups across", nrow(hru_soil_map), "hillslope HRUs.\n")
+```
+
+
+# RUN MODEL
+```{r add snow parameters to model object}
+# 2. Patch the HRUs with snow parameters, temp linkages, and expanded states
+for (i in seq_along(mdl$hru)) {
+  
+  # A. Add the snow parameters
+  mdl$hru[[i]]$snow <- list(
+    type = "hbv",
+    parameters = c(T_T = 0.0, C_f = 2.5, C_wh = 0.1)
+  )
+  
+  # B. Add the temp linkage 
+  # Note: The original precip linkage uses 'name' and 'fraction'
+  # We will map it to a dummy "temp_series"
+  mdl$hru[[i]]$temp <- list(
+    name = "temp_series",
+    fraction = 1.0
+  )
+  
+  # C. Expand the states to include s_snow and s_liquid
+  mdl$hru[[i]]$states <- c(
+    mdl$hru[[i]]$states, 
+    s_snow = 0.0, 
+    s_liquid = 0.0
+  )
+}
+
+# fpar <- function(h){ ## h is the hru
+#     ## test if a channel
+#     if( !is.na(h$class$startNode) ){
+#         ## change type
+#         h$sf$type <- "cnst"
+#         h$sf$parameters["csf"] <- 1
+#     }
+#     h
+# }
+# mdl$hru <- lapply(mdl$hru, fpar)
+
+# function to set snow states to zero
+
+fix_snow <- function(mdl){
+  for(ii in seq_along(mdl)){
+      mdl[[ii]]$states$s_snow <- 0
+      mdl[[ii]]$states$s_liquid <- 0
+  }
+  return(mdl)
+}
+
+mdl_after2 <- fix_snow(mdl_after)
+```
+
+```{r plot HRUS}
+
+hru_map <- rast(mdl$map) 
+
+# Rename the raster layer so we can call it easily in ggplot
+names(hru_map) <- "hru_id"
+
+# 3. Convert the raster to polygons to calculate the center of each HRU
+hru_poly <- as.polygons(hru_map)
+
+# Calculate the centroids (center points) of each polygon for the text labels
+hru_centroids <- centroids(hru_poly)
+
+# Extract coordinates into a standard dataframe for ggplot
+centroid_coords <- crds(hru_centroids, df = TRUE)
+centroid_coords$hru_id <- hru_centroids$hru_id
+              # 4. Plot using tidyterra and ggplot2
+channels <- centroid_coords %>% 
+  filter(hru_id %in% unique(sensor_hru_map$hru_id))
+
+get_channel_hrus <- function(mdl) {
+  #if (is.character(mdl)) mdl <- readRDS(mdl)
+  mdl$channel[, c("id", "area")]
+}
+
+test <- get_channel_hrus(mdl)
+mdl$hru[, c("id", "area")]
+# fpar <- function(h){ ## h is the hru
+#     ## test if a channel
+#     if( !is.na(h$class$startNode) ){
+#         ## change type
+#         h$sf$type <- "cnst"
+#         h$sf$parameters["csf"] <- 1
+#     }
+#     h
+# }
+# mdl$hru <- lapply(mdl$hru, fpar)
+
+ggplot() +
+  # Plot the raster base map (using factor for discrete colors)
+  geom_spatraster(data = as.factor(hru_map)) +
+  # Overlay the polygon boundaries
+  #geom_spatvector(data = hru_poly, fill = NA, color = "black", linewidth = 0.3, alpha = 0.2) +
+  # Add the ID labels at the center of each HRU
+  geom_text(data = channels, aes(x = x, y = y, label = hru_id),
+            color = "black", fontface = "bold", size = 4) +
+  # Use a nice color palette and remove the bulky legend
+  scale_fill_viridis_d(option = "turbo", na.value = "transparent", guide = "none") +
+  # lims(x = c(281500, 281700),
+  #      y = c(4870400, 4870500))+
+  theme_minimal() +
+  labs(title = "Hubbard Brook HRU Map")+
+  theme_void()
+#ggsave("HRU.png", scale = 3)
+```
+
+```{r test run model}
+# Load previously created data
+output_defn <- data.frame(name = c("q_sf", "v_sf_rz"),
+                      id = 0,
+                      flux = c("s_sf", "v_sf_rz"),
+                      scale = c(1, -1/900))
+#mdl <- readRDS(file.path(".","dynaGIS","atb_20.rds"))
+#obs <- readRDS(file.path(".","processed","obs.rds"))
+# initialize dynatop object
+
+## determining the initial recharge rate ad setting it in the model
+# I think the same number is the watershed area...
+#r0 <- as.numeric(obs[1, "Streamflow"])#/ 86400
+#r0 <- as.numeric(obs$Streamflow[1])
+r0 <- as.numeric(obs$Discharge_m3_s[1])/ sum( sapply( mdl$hru, function(x){x$properties["area"]} ) )
+mdl$hru <- lapply(mdl$hru,function(h){h$initialisation["r_uz_sz_0"] <- r0;h})
+
+#start <- "2020-01-01"
+#end <- "2020-01-31"
+
+cal_start    <- as.POSIXct(start, tz = "UTC")
+cal_end      <- as.POSIXct(end, tz = "UTC")
+
+obs_sim      <- obs[index(obs) >= cal_start & index(obs) <= cal_end, ]
+obs_q        <- obs_sim[, "Discharge_m3_s"]
+## the map input is only needed for visualisation
+Sys.time()
+ctch_mdl <- dynatop$new(mdl$hru, map = mdl$map
+  )$add_data( obs_sim
+  )$initialise(
+  )$sim(mdl$output_flux, sub_step = 3600
+  )
+
+
+mdl_after <- ctch_mdl$get_model()
+
+mdl_after[[1]]$states
+# Gauge Flows
+sim_gauge <- ctch_mdl$get_output() ## extract the flow as an xts object
+sim_gauge[1:50,]
+plot(sim_gauge[,1],main="Simulated and observed flows",
+     legend.loc='topright',
+     xlim = c( as.POSIXct("2020-01-03", tz = "UTC")))
+plot(merge(sim_gauge[,1], obs_q$Discharge_m3_s),main="Simulated and observed flows",
+     legend.loc='topright')
+
+
+```
+
+```{r}
+# ── 1. Check if rapply deep copy is actually in run_model ─────────────────────
+# Print first few lines of run_model body to confirm
+head(deparse(body(run_model)), 20)
+# Must show: hru <- rapply(mdl_template$hru, function(x) x, how = "replace")
+# If it shows: hru <- mdl_template$hru   ← this is the bug
+
+# ── 2. Compare initialization values ─────────────────────────────────────────
+# What does run_model set vs what the default model has?
+cat("Default s_rz_0:   ", mdl$hru[[1]]$initialisation["s_rz_0"], "\n")
+cat("Default r_uz_sz_0:", mdl$hru[[1]]$initialisation["r_uz_sz_0"], "\n")
+
+# What does run_model compute?
+total_area <- sum(sapply(mdl$hru, function(h) h$properties["area"]))
+q_init     <- as.numeric(na.omit(obs_sim$Discharge_m3_s))[1]
+cat("run_model s_rz_0:   ", 0.1, "\n")
+cat("run_model r_uz_sz_0:", q_init / total_area, "\n")
+cat("q_init:", q_init, "\n")
+cat("total_area:", total_area, "\n")
+
+# ── 3. Check what parameters run_model actually applies ───────────────────────
+# Temporarily add print statements to run_model:
+default_params <- c(t_0=0.135, m=0.040, t_d=28800, s_rzmax=0.1,
+                    c_sf=0.3, n_ch=0.05, v_ch=1.0,
+                    T_T=0.0, C_f=0.002, C_wh=1.0)
+
+# Check one hillslope and one channel HRU after parameter setting
+hru_test <- rapply(mdl$hru, function(x) x, how = "replace")
+is_channel_1 <- isTRUE(!is.na(hru_test[[1]]$class$endNode))
+cat("HRU 1 is channel:", is_channel_1, "\n")
+
+# Apply params manually as run_model would
+for(ii in seq_along(hru_test)){
+  is_channel <- isTRUE(!is.na(hru_test[[ii]]$class$endNode))
+  if(!is_channel){
+    hru_test[[ii]]$sz$parameters["t_0"]     <- default_params["t_0"]
+    hru_test[[ii]]$sz$parameters["m"]       <- default_params["m"]
+    hru_test[[ii]]$uz$parameters["t_d"]     <- default_params["t_d"]
+    hru_test[[ii]]$rz$parameters["s_rzmax"] <- default_params["s_rzmax"]
+    if(hru_test[[ii]]$sf$type == "cnst")
+      hru_test[[ii]]$sf$parameters["c_sf"]  <- default_params["c_sf"]
+  } else {
+    hru_test[[ii]]$sz$parameters["t_0"]     <- 0.001
+    hru_test[[ii]]$sz$parameters["m"]       <- 0.001
+    hru_test[[ii]]$rz$parameters["s_rzmax"] <- 0.001
+    if(hru_test[[ii]]$sf$type == "cnst"){
+      hru_test[[ii]]$sf$parameters["c_sf"]  <- default_params["v_ch"]
+      hru_test[[ii]]$sf$parameters["t_raf"] <- 999.9
+    }
+  }
+}
+
+# Print a hillslope and channel HRU to verify
+hs_idx <- which(!sapply(hru_test, function(h) isTRUE(!is.na(h$class$endNode))))[1]
+ch_idx <- which( sapply(hru_test, function(h) isTRUE(!is.na(h$class$endNode))))[1]
+
+cat("\nHillslope HRU", hru_test[[hs_idx]]$id, "after param setting:\n")
+cat("  sz:", hru_test[[hs_idx]]$sz$parameters, "\n")
+cat("  uz:", hru_test[[hs_idx]]$uz$parameters, "\n")
+cat("  rz:", hru_test[[hs_idx]]$rz$parameters, "\n")
+cat("  sf:", hru_test[[hs_idx]]$sf$parameters, "\n")
+
+cat("\nChannel HRU", hru_test[[ch_idx]]$id, "after param setting:\n")
+cat("  sz:", hru_test[[ch_idx]]$sz$parameters, "\n")
+cat("  rz:", hru_test[[ch_idx]]$rz$parameters, "\n")
+cat("  sf:", hru_test[[ch_idx]]$sf$parameters, "\n")
+
+# ── 4. Compare obs passed to run_model vs default run ─────────────────────────
+cat("\nobs_sim columns:", names(obs_sim), "\n")
+cat("obs_sim nrow:", nrow(obs_sim), "\n")
+cat("obs_sim date range:", format(range(index(obs_sim))), "\n")
+
+# The default run presumably used obs directly — does it include spin-up?
+cat("Does obs_sim include spin-up period before cal_start?",
+    min(index(obs_sim)) < cal_start, "\n")
+cat("obs_sim start:", format(min(index(obs_sim))), "\n")
+cat("cal_start:    ", format(cal_start), "\n")
+
+# ── 5. Run the model both ways side by side ───────────────────────────────────
+obs_input <- strip_obs(obs_sim)
+
+# Way 1: exactly as run_model does it (with rapply copy and param setting)
+cm1 <- dynatop$new(hru_test, map = mdl$map)
+cm1$add_data(obs_input)
+cm1$initialise()
+out1 <- cm1$sim(data.frame(name="q_out", id=OUTLET_ID,
+                            flux="q_sf", scale=1.0,
+                            stringsAsFactors=FALSE),
+                sub_step=3600)$get_output()
+cat("\nWay 1 (run_model style) KGE:", kge(out1[,"q_out"], obs_q), "\n")
+cm1$get_model()[[1]]$sz$parameters
+cm1$get_model()[[1]]$uz$parameters
+cm1$get_model()[[1]]$rz$parameters
+cm1$get_model()[[1]]$sf$parameters
+# Way 2: default run with unmodified mdl$hru
+cm2 <- dynatop$new(mdl$hru, map = mdl$map)
+cm2$add_data(obs_input)
+cm2$initialise()
+out2 <- cm2$sim(data.frame(name="q_out", id=OUTLET_ID,
+                            flux="q_sf", scale=1.0,
+                            stringsAsFactors=FALSE),
+                sub_step=3600)$get_output()
+cat("Way 2 (default mdl$hru) KGE:", kge(out2[,"q_out"], obs_q), "\n")
+cm2$get_model()[[1]]$sz$parameters
+cm2$get_model()[[1]]$uz$parameters
+cm2$get_model()[[1]]$rz$parameters
+cm2$get_model()[[1]]$sf$parameters
+# If Way 1 ≠ Way 2, the parameter or init setting is the cause
+# If both ≠ 0.27, the obs_input or output definition is the cause
+```
+
+# PARAMETERIZE
+
+```{r param attempt 3}
+# =============================================================================
+# dynatop GLUE Calibration — revised framework
+# Key changes:
+#   1. Spin-up period added before cal_start
+#   2. Log-uniform LHS for wide-range parameters
+#   3. Realistic bounds (c_sf and t_0 lowered, v_ch allowed to vary)
+#   4. s_rz_0 initialized as fraction of s_rzmax (channels no longer blow up)
+#   5. m explicitly set for channel HRUs
+#   6. Two-stage GLUE:  Stage 1 = screen on KGE only to tighten bounds
+#                       Stage 2 = focused GLUE with PA + strict KGE
+#   7. Optional: include q_sz at outlet to check structural mass balance
+# =============================================================================
+
+# =============================================================================
+# 1. LOAD MODEL AND DATA
+# =============================================================================
+# mdl <- readRDS(file.path(".", "hb_data", "dynaGIS", "atb_20.rds"))
+# obs <- readRDS(file.path(".", "processed", "obs.rds"))
+
+# -- Windows ------------------------------------------------------------------
+SPIN_DAYS    <- 90                    # spin-up length before cal_start
+cal_start    <- as.POSIXct(start, tz = "UTC")
+cal_end      <- as.POSIXct(end, tz = "UTC")
+sim_start    <- cal_start - SPIN_DAYS*24
+
+obs_sim      <- obs[index(obs) >= sim_start & index(obs) <= cal_end, ]
+obs_eval     <- obs[index(obs) >= cal_start & index(obs) <= cal_end, ]
+obs_q        <- obs_eval[, "Discharge_m3_s"]   # keep as xts for time alignment
+
+# -- Confirm outlet HRU --------------------------------------------------------
+for(ii in seq_along(mdl$hru)){
+  h <- mdl$hru[[ii]]
+  if(length(h$sf_flow_direction$id) == 0 & length(h$sz_flow_direction$id) == 0)
+    cat("Outlet HRU id:", h$id, "| is channel:", !is.na(h$class$endNode), "\n")
+}
+OUTLET_ID <- 0L
+
+# =============================================================================
+# 2. FLOW PRESENCE/ABSENCE OBSERVATIONS
+# =============================================================================
+#all_24 <- read_csv("/Users/johnmorgan/Documents/VT Research/HBTopModel/STIC_Synthesis/02_BinaryMatrix/Binary_hb_w3.csv")
+all_24 <- read_csv("/Users/johnmorgan/Documents/VT Research/HBTopModel/STIC_Synthesis/all_24.csv") %>% 
+  filter(wshed == "W3") %>% 
+  select(datetime, wetdry, number, lat, long) %>% 
+  filter(number %in% sensor_hru_key$sensor_id)
+
+
+
+all_23 <- read_csv("/Users/johnmorgan/Documents/VT Research/HBTopModel/STIC_Synthesis/all_23.csv") %>% 
+  filter(wshed == "W3") %>% 
+  select(datetime, wetdry, ID, lat, long) %>% 
+  rename(number = ID) %>% 
+  filter(number %in% sensor_hru_key$sensor_id)
+
+
+
+stic_locs <- all_23 %>% 
+  bind_rows(all_24) %>%
+  select(number, lat, long) %>%
+  distinct() %>%
+  vect(geom = c("long", "lat"), crs = "EPSG:4326") %>%
+  project("EPSG:26919")
+
+all_out <- do.call(rbind, lapply(seq_len(nrow(stic_locs)), function(i){
+  dist_table <- distance(stic_locs[i,], vect_final)
+  idx        <- which.min(dist_table)[1]
+  data.frame(ID         = stic_locs[i,]$number,
+             channel_ID = vect_final[idx,]$name,
+             dist       = min(dist_table))
+}))
+
+chosen <- all_out %>% filter(dist <= 30)
+# pa_obs <- all_24 %>%
+#   filter(wshed == "W3", number %in% sensor_hru_map$sensor_id) %>%
+#   left_join(sensor_hru_map, by = c("number" = "sensor_id")) %>%
+#   mutate(hru_id = hru_id, ...)
+#sensor_hru_map$sensor_id <- as.numeric(sensor_hru_map$sensor_id)
+sensor_hru_key
+pa_obs <- 
+  all_23 %>% 
+  bind_rows(all_24) %>%
+  filter(number %in% sensor_hru_key$sensor_id) %>%
+  select(datetime, number, wetdry) %>%
+  rename(ID = number) %>%
+  left_join(sensor_hru_key, by = c("ID" = "sensor_id")) %>%
+  #left_join(chosen, by = "ID", relationship = "many-to-one") %>%
+  mutate(
+    observed = as.integer(case_when(wetdry == "wet" ~ 1, wetdry == "dry" ~ 0)),
+    datetime = as.POSIXct(datetime, tz = "UTC")
+  ) %>%
+  select(hru_id, datetime, observed) %>%
+  filter(datetime >= cal_start, datetime <= cal_end,
+         !is.na(hru_id), !is.na(observed))
+
+cat("PA sites:", sort(unique(pa_obs$hru_id)), "\n")
+cat("PA obs:", nrow(pa_obs), "| flowing:", sum(pa_obs$observed == 1),
+    "| dry:", sum(pa_obs$observed == 0), "\n")
+
+# Threshold for simulated "flowing" (m3/s). Adjust after Stage 1 diagnostics.
+FLOW_THRESHOLD <- 1e-4   # 0.1 L/s is more defensible than 1e-8 for small streams
+
+# =============================================================================
+# 3. PARAMETER SPACE (Modified for 3 soil groups)
+# =============================================================================
+param_bounds <- data.frame(
+  name  = c("t_0_1", "t_0_2", "t_0_3", 
+            "m_1",   "m_2",   "m_3",   
+            "t_d_1", "t_d_2", "t_d_3", 
+            "s_rzmax", "c_sf", "T_T", "C_f"),
+            
+  # Lower bounds
+  lower = c(0.5,   0.1,   0.01,   # t_0: Group 1 (high), Group 2 (mod), Group 3 (low)
+            0.01,  0.02,  0.001,  # m:   Group 1 (mod), Group 2 (high/deep), Group 3 (low/shallow)
+            3600,  43200, 3600,   # t_d: Group 1 (fast), Group 2 (slow), Group 3 (very fast)
+            0.03,  0.01, -2.0,  0.1), # Other parameters (from original framework)
+            
+  # Upper bounds
+  upper = c(5.0,   1.0,   0.5,    # t_0 
+            0.03,  0.05,  0.01,   # m   
+            28800, 172800,14400,  # t_d 
+            0.3,   0.5,   2.0,  5.0), # Other parameters
+            
+  # Log-uniform sampling flags
+  log   = c(TRUE,  TRUE,  TRUE,   # t_0 (usually spans orders of magnitude)
+            FALSE, FALSE, FALSE,  # m (usually sampled uniformly within its narrow range)
+            TRUE,  TRUE,  TRUE,   # t_d (spans orders of magnitude)
+            FALSE, TRUE,  FALSE, TRUE),
+            
+  stringsAsFactors = FALSE
+)
+
+n_params <- nrow(param_bounds)
+
+strip_obs <- function(obs_xts){
+  drop <- c("Discharge_m3_s", "Discharge_ls", "Discharge")
+  keep <- !(names(obs_xts) %in% drop)
+  obs_xts[, keep]
+}
+
+# =============================================================================
+# 4. MODEL RUNNER (Modified)
+# =============================================================================
+run_model <- function(params,
+                      mdl_template,
+                      obs,
+                      outlet_id  = 0L,
+                      pa_hru_ids = sort(unique(pa_obs$hru_id)),
+                      sub_step   = 3600,
+                      include_sz = FALSE){        
+  
+  hru <- rapply(mdl_template$hru, function(x) x, how = "replace")
+  obs_input  <- strip_obs(obs)
+  total_area <- sum(sapply(hru, function(h) h$properties["area"]))
+  
+  q_init <- as.numeric(na.omit(obs$Discharge_m3_s))[1]
+  if(!is.finite(q_init) || q_init <= 0) q_init <- 1e-5
+  
+  # --- CONSTANTS ---
+  CONSTANT_V_CH <- 1.0  # Adjust your fixed channel velocity here
+  CONSTANT_N_CH <- 0.05 # Adjust your fixed Manning's n (if using kinematic)
+  CONSTANT_C_WH <- 0.2  # Adjust your fixed water holding capacity
+  
+  for(ii in seq_along(hru)){
+    is_channel <- isTRUE(!is.na(hru[[ii]]$class$endNode))
+    
+    if(!is_channel){
+      # Fetch the soil index (1, 2, or 3) from the map generated earlier
+      s_idx <- hru_soil_map$soil_idx[hru_soil_map$hru_index == ii]
+      
+      hru[[ii]]$sz$parameters["t_0"]     <- params[paste0("t_0_", s_idx)]
+      hru[[ii]]$sz$parameters["m"]       <- params[paste0("m_", s_idx)]
+      hru[[ii]]$uz$parameters["t_d"]     <- params[paste0("t_d_", s_idx)]
+      hru[[ii]]$rz$parameters["s_rzmax"] <- params["s_rzmax"]
+      
+      if(hru[[ii]]$sf$type == "cnst"){
+        hru[[ii]]$sf$parameters["c_sf"]  <- params["c_sf"]
+      }
+    } else {
+      hru[[ii]]$sz$parameters["t_0"]     <- 0.001
+      hru[[ii]]$sz$parameters["m"]       <- 0.001        
+      hru[[ii]]$rz$parameters["s_rzmax"] <- 0.001
+      
+      # Apply Constants
+      if(hru[[ii]]$sf$type == "cnst"){
+        hru[[ii]]$sf$parameters["c_sf"]  <- CONSTANT_V_CH
+      } else if(hru[[ii]]$sf$type == "kin"){
+        hru[[ii]]$sf$parameters["n"]     <- CONSTANT_N_CH
+        hru[[ii]]$sf$parameters["t_raf"] <- 999.9
+        hru[[ii]]$sf$parameters["s_raf"] <- 0
+      }
+    }
+    
+    # Snow parameters (C_wh is constant)
+    hru[[ii]]$snow$parameters["T_T"]  <- params["T_T"]
+    hru[[ii]]$snow$parameters["C_f"]  <- params["C_f"]
+    hru[[ii]]$snow$parameters["C_wh"] <- CONSTANT_C_WH
+    
+    # Initial conditions
+    s_rzmax_val <- if(!is_channel) as.numeric(params["s_rzmax"]) else 0.001
+    hru[[ii]]$initialisation["s_rz_0"]    <- min(0.5 * s_rzmax_val, 0.3)
+    hru[[ii]]$initialisation["r_uz_sz_0"] <- q_init / total_area
+    
+    if("s_sz_0" %in% names(hru[[ii]]$initialisation)){
+      hru[[ii]]$initialisation["s_sz_0"] <- 0.001
+    }
+  }
+  
+  pa_ids <- unique(pa_hru_ids)
+  out_rows <- data.frame(
+    name  = c("q_out", if(include_sz) "q_out_sz", paste0("q_sf_hru", pa_ids)),
+    id    = c(outlet_id, if(include_sz) outlet_id, pa_ids),
+    flux  = c("q_sf", if(include_sz) "q_sz", rep("q_sf", length(pa_ids))),
+    scale = 1.0,
+    stringsAsFactors = FALSE
+  )
+  
+  result <- tryCatch({
+    cm <- dynatop$new(hru, map = mdl_template$map)
+    cm$add_data(obs_input)
+    cm$initialise()
+    cm$sim(out_rows, sub_step = sub_step)$get_output()
+  }, error = function(e){
+    warning("run_model error: ", conditionMessage(e))
+    NULL
+  })
+  return(result)
+}
+
+# =============================================================================
+# 5. DIAGNOSTIC (revised)
+# =============================================================================
+run_diagnostic <- function(mdl, obs_sim, obs_eval, pa_obs,
+                           outlet_id = 0L, sub_step = 900, include_sz = FALSE){
+  
+  obs_input <- strip_obs(obs_sim)
+  nms <- c("q_sf_out", "s_sf_out", "s_sz_out", "q_sz_out")
+  if(include_sz) nms <- c(nms, "q_total_out")
+  
+  diag_rows <- data.frame(
+    name  = c("q_sf_out", "s_sf_out", "s_sz_out", "q_sz_out"),
+    id    = outlet_id,
+    flux  = c("q_sf", "s_sf", "s_sz", "q_sz"),
+    scale = 1.0,
+    stringsAsFactors = FALSE
+  )
+  
+  cm <- dynatop$new(mdl$hru, map = mdl$map)
+  cm$add_data(obs_input)
+  cm$initialise()
+  diag_out <- cm$sim(diag_rows, sub_step = sub_step)$get_output()
+  
+  # Evaluate only over cal window
+  eval_idx <- index(diag_out) >= index(obs_eval)[1] & index(diag_out) <= tail(index(obs_eval),1)
+  q_sf_win <- diag_out[eval_idx, "q_sf_out"]
+  q_sz_win <- diag_out[eval_idx, "q_sz_out"]
+  
+  q_tot <- if(include_sz) q_sf_win + q_sz_win else q_sf_win
+  
+  cat("=== Diagnostics (evaluation window) ===\n")
+  cat("q_sf range (m3/s):", signif(range(as.numeric(q_sf_win)), 3), "\n")
+  if(include_sz) cat("q_sz range (m3/s):", signif(range(as.numeric(q_sz_win)), 3), "\n")
+  cat("Sim Total range  :", signif(range(as.numeric(q_tot)), 3), "\n")
+  cat("obs_q range      :", signif(range(as.numeric(obs_eval$Discharge_m3_s), na.rm=TRUE), 3), "\n")
+  cat("Bias (sim/obs)   :", signif(mean(q_tot, na.rm=TRUE)/mean(obs_eval$Discharge_m3_s, na.rm=TRUE), 3), "\n")
+  
+  s_sf_vals <- as.numeric(diag_out[,"s_sf_out"])
+  if(tail(s_sf_vals,1) > 10 * s_sf_vals[1] + 1){
+    cat("WARNING: s_sf growing unboundedly.\n")
+  } else {
+    cat("s_sf appears stable.\n")
+  }
+  
+  # PA quick look
+  pa_ids <- sort(unique(pa_obs$hru_id))
+  pa_rows <- data.frame(
+    name  = paste0("q_sf_hru", pa_ids),
+    id    = pa_ids,
+    flux  = "q_sf",
+    scale = 1.0,
+    stringsAsFactors = FALSE
+  )
+  cm2 <- dynatop$new(mdl$hru, map = mdl$map)
+  cm2$add_data(obs_input)
+  cm2$initialise()
+  pa_out <- cm2$sim(pa_rows, sub_step = sub_step)$get_output()
+  
+  cat("\n=== PA site q_sf (during eval window) ===\n")
+  for(hid in pa_ids){
+    col <- paste0("q_sf_hru", hid)
+    sub <- pa_obs[pa_obs$hru_id == hid & pa_obs$observed == 1, ]
+    if(nrow(sub) == 0 || !(col %in% names(pa_out))) next
+    win <- pa_out[index(pa_out) >= cal_start & index(pa_out) <= cal_end, col]
+    cat(sprintf("HRU %d | min=%.2e max=%.2e (obs flow n=%d)\n",
+                hid, min(win, na.rm=TRUE), max(win, na.rm=TRUE), nrow(sub)))
+  }
+  invisible(list(diag_out = diag_out, pa_out = pa_out))
+}
+
+cat("Running diagnostic with template defaults (include_sz = TRUE)...\n")
+Sys.time()
+diag <- run_diagnostic(mdl, obs_sim, obs_eval, pa_obs,
+                       outlet_id = OUTLET_ID, include_sz = TRUE)
+Sys.time()
+# After seeing diagnostics, set this to TRUE if q_sz is a major part of discharge
+INCLUDE_SZ_AT_OUTLET <- FALSE
+
+# =============================================================================
+# 6. OBJECTIVE FUNCTIONS
+# =============================================================================
+kge <- function(sim, obs){
+  both  <- merge(sim, obs, join = "inner")
+  s     <- as.numeric(both[, 1])
+  o     <- as.numeric(both[, 2])
+  valid <- is.finite(s) & is.finite(o) & abs(s) < 1e4
+  if(sum(valid) < 10) return(-Inf)
+  s <- s[valid]; o <- o[valid]
+  r <- cor(s, o); if(!is.finite(r)) return(-Inf)
+  a <- sd(s) / sd(o)
+  b <- mean(s) / mean(o)
+  1 - sqrt((r - 1)^2 + (a - 1)^2 + (b - 1)^2)
+}
+
+bias_ratio <- function(sim, obs){
+  both <- merge(sim, obs, join = "inner")
+  mean(as.numeric(both[,1]), na.rm=TRUE) / mean(as.numeric(both[,2]), na.rm=TRUE)
+}
+
+csi_presence_absence <- function(sim_output, pa_obs, threshold = FLOW_THRESHOLD){
+  TP <- FP <- FN <- TN <- 0L
+  for(hid in unique(pa_obs$hru_id)){
+    col_name <- paste0("q_sf_hru", hid)
+    if(!col_name %in% names(sim_output)) next
+    sub_obs <- pa_obs[pa_obs$hru_id == hid, ]
+    if(nrow(sub_obs) == 0) next
+    sub_xts <- xts(sub_obs$observed, order.by = as.POSIXct(sub_obs$datetime, tz = "UTC"))
+    both    <- merge(sim_output[, col_name], sub_xts, join = "inner")
+    if(nrow(both) == 0) next
+    sim_bin <- as.integer(as.numeric(both[, 1]) >= threshold)
+    obs_bin <- as.integer(as.numeric(both[, 2]))
+    valid   <- !is.na(sim_bin) & !is.na(obs_bin)
+    sim_bin <- sim_bin[valid]; obs_bin <- obs_bin[valid]
+    if(length(sim_bin) == 0) next
+    TP <- TP + sum(sim_bin == 1L & obs_bin == 1L)
+    FP <- FP + sum(sim_bin == 1L & obs_bin == 0L)
+    FN <- FN + sum(sim_bin == 0L & obs_bin == 1L)
+    TN <- TN + sum(sim_bin == 0L & obs_bin == 0L)
+  }
+  denom <- TP + FP + FN
+  if(denom == 0) return(NULL)
+  list(
+    CSI = TP / denom,
+    #CSI = if((TP+FP+FN+TN)>0) (TP+TN)/(TP+FP+FN+TN) else 0,
+    POD = if((TP+FN)>0) TP/(TP+FN) else 0,
+    FAR = if((TP+FP)>0) FP/(TP+FP) else 0,
+    F1  = if((2*TP+FP+FN)>0) 2*TP/(2*TP+FP+FN) else 0,
+    accuracy = if((TP+FP+FN+TN)>0) (TP+TN)/(TP+FP+FN+TN) else 0,
+    TP=TP, FP=FP, FN=FN, TN=TN
+  )
+}
+
+# =============================================================================
+# 7. GLUE INFRASTRUCTURE
+# =============================================================================
+W_KGE <- 0.5
+W_CSI <- 0.5
+CSI_THRESHOLD <- 0.0
+
+glue_likelihood <- function(kge_val, csi_val, kge_thresh){
+  if(!is.finite(kge_val) || kge_val < kge_thresh) return(0)
+  if(!is.finite(csi_val) || csi_val < CSI_THRESHOLD) return(0)
+  kge_scaled <- (kge_val - kge_thresh) / (1 - kge_thresh)
+  csi_scaled <- csi_val
+  L_kge <- if(W_KGE > 0) kge_scaled ^ W_KGE else 1
+  L_csi <- if(W_CSI > 0) csi_scaled ^ W_CSI else 1
+  L_kge * L_csi
+}
+
+# Vectorized parameter sampler
+generate_lhs <- function(n_samp, pb){
+  d <- randomLHS(n_samp, nrow(pb))
+  M <- matrix(NA, nrow=n_samp, ncol=nrow(pb))
+  colnames(M) <- pb$name
+  for(i in seq_len(nrow(pb))){
+    lo <- pb$lower[i]; up <- pb$upper[i]
+    if(pb$log[i]){
+      loglo <- log10(lo); logup <- log10(up)
+      M[,i] <- 10^(d[,i]*(logup - loglo) + loglo)
+    } else {
+      M[,i] <- d[,i]*(up - lo) + lo
+    }
+  }
+  M
+}
+
+# Generic GLUE evaluator
+glue_eval <- function(param_vec,
+                      include_sz = FALSE,
+                      use_pa     = TRUE,
+                      kge_thresh = 0.0){
+  
+  params <- setNames(param_vec, param_bounds$name)
+  
+  # Hard guards for multiple soil groups
+  if(any(params[c("t_d_1", "t_d_2", "t_d_3")] < 900)) return(list(L=0, kge=NA, csi=NA, bias=NA))
+  if(params["s_rzmax"] <= 0)  return(list(L=0, kge=NA, csi=NA, bias=NA))
+  
+  sim <- run_model(params, mdl_template, obs_sim,
+                   outlet_id  = OUTLET_ID,
+                   pa_hru_ids = sort(unique(pa_obs$hru_id)),
+                   include_sz = include_sz)
+  
+  if(is.null(sim)) return(list(L=0, kge=NA, csi=NA, bias=NA))
+  
+  # Outlet discharge (xts, full length incl. spinup; merge with obs_q auto-subsets)
+  sim_q <- if(include_sz && "q_out_sz" %in% names(sim)){
+    sim[,"q_out"] + sim[,"q_out_sz"]
+  } else {
+    sim[,"q_out"]
+  }
+  
+  if(any(!is.finite(sim_q))) return(list(L=0, kge=NA, csi=NA, bias=NA))
+  
+  kge_val   <- kge(sim_q, obs_q)
+  bias_val  <- bias_ratio(sim_q, obs_q)
+  pa_scores <- if(use_pa) csi_presence_absence(sim, pa_obs) else NULL
+  csi_val   <- if(!is.null(pa_scores) && is.finite(pa_scores$CSI)) pa_scores$CSI else 0
+  #accuracy <- if(!is.null(pa_scores) && is.finite(pa_scores$accuracy)) pa_scores$accuracy else 0
+  
+  # Inside glue_eval, replace the single L <- ... line with:
+  if(!use_pa){
+    # Screening: pure KGE ranking, ignore CSI
+    if(!is.finite(kge_val) || kge_val < kge_thresh){
+      L <- 0
+    } else {
+      L <- ((kge_val - kge_thresh) / (1 - kge_thresh)) ^ W_KGE
+    }
+  } else {
+    L <- glue_likelihood(kge_val, csi_val, kge_thresh)
+  }
+  list(L = L, kge = kge_val, csi = csi_val, bias = bias_val)
+}
+
+run_glue <- function(n_samples,
+                     param_bounds,
+                     mdl_template,
+                     obs_sim,
+                     obs_q,
+                     pa_obs,
+                     outlet_id    = 0L,
+                     n_cores      = 1L,
+                     seed         = 42L,
+                     use_pa       = TRUE,
+                     kge_thresh   = 0.0,
+                     include_sz   = FALSE,
+                     sub_step     = 900){
+  
+  set.seed(seed)
+  n_params <- nrow(param_bounds)
+  param_matrix <- generate_lhs(n_samples, param_bounds)
+  
+  cat(sprintf("Running %d GLUE samples (%s) on %d core(s)...\n",
+              n_samples,
+              if(use_pa) "KGE+CSI" else "KGE only",
+              n_cores))
+  
+  # Local wrapper so that parApply/exporting is clean
+  obj_wrap <- function(v){
+    glue_eval(v,
+              include_sz = include_sz,
+              use_pa     = use_pa,
+              kge_thresh = kge_thresh)
+  }
+  
+  if(n_cores > 1L){
+    cl <- makeCluster(n_cores)
+    on.exit(stopCluster(cl), add = TRUE)
+    clusterExport(cl,
+      c("mdl_template","obs_sim","obs_q","pa_obs","param_bounds",
+        "OUTLET_ID","FLOW_THRESHOLD","W_KGE","W_CSI","CSI_THRESHOLD",
+        "run_model","strip_obs","kge","bias_ratio","csi_presence_absence",
+        "glue_likelihood","glue_eval","generate_lhs", "hru_soil_map"),
+      envir = environment())
+    clusterEvalQ(cl, { library(dynatop); library(xts) })
+    score_list <- parApply(cl, param_matrix, 1, obj_wrap)
+  } else {
+    score_list <- apply(param_matrix, 1, obj_wrap)
+  }
+  
+  results <- data.frame(
+    param_matrix,
+    L    = sapply(score_list, `[[`, "L"),
+    kge  = sapply(score_list, `[[`, "kge"),
+    csi  = sapply(score_list, `[[`, "csi"),
+    bias = sapply(score_list, `[[`, "bias")
+  )
+  
+  n_behav <- sum(results$L > 0, na.rm = TRUE)
+  cat(sprintf("Behavioural: %d / %d (%.1f%%) | Best KGE: %.3f\n",
+              n_behav, n_samples, 100*n_behav/n_samples,
+              max(results$kge, na.rm=TRUE)))
+  
+  if(n_behav == 0)
+    cat("No behavioural runs — try lowering kge_thresh or check run_model.\n")
+  
+  results$L_norm <- if(sum(results$L, na.rm=TRUE) > 0){
+    results$L / sum(results$L, na.rm=TRUE)
+  } else NA_real_
+  
+  results[order(-results$L), ]
+}
+
+# =============================================================================
+# 8. UNCERTAINTY BOUNDS (unchanged logic, accepts include_sz via run_model)
+# =============================================================================
+glue_uncertainty_bounds <- function(glue_results, param_bounds,
+                                    mdl_template, obs_sim, obs_q,
+                                    outlet_id = 0L,
+                                    quantiles = c(0.05, 0.95),
+                                    include_sz = FALSE){
+  
+  behav <- glue_results[glue_results$L > 0 & !is.na(glue_results$L), ]
+  if(nrow(behav) == 0) stop("No behavioural runs.")
+  cat(sprintf("Bounds from %d behavioural runs...\n", nrow(behav)))
+  
+  sim_list <- lapply(seq_len(nrow(behav)), function(i){
+    p <- setNames(as.numeric(behav[i, param_bounds$name]), param_bounds$name)
+    s <- run_model(p, mdl_template, obs_sim, outlet_id,
+                   include_sz = include_sz)
+    if(is.null(s)) return(NULL)
+    q <- if(include_sz && "q_out_sz" %in% names(s)) s[,"q_out"] + s[,"q_out_sz"] else s[,"q_out"]
+    as.numeric(q)
+  })
+  
+  good  <- !sapply(sim_list, is.null)
+  sims  <- sim_list[good]
+  L_w   <- behav$L_norm[good]
+  L_w   <- L_w / sum(L_w)
+  
+  sim_mat <- do.call(cbind, sims)
+  # align with obs_q (just in case spinup mismatched length)
+  nobs <- length(na.omit(as.numeric(obs_q)))
+  if(nrow(sim_mat) != nobs){
+    # attempt to trim to evaluation window index length
+    sim_mat <- sim_mat[(nrow(sim_mat)-nobs+1):nrow(sim_mat), , drop=FALSE]
+  }
+  
+  bounds <- data.frame(
+    datetime = index(obs_q),
+    q_obs    = as.numeric(obs_q),
+    q_best   = sim_mat[, which.max(L_w)],
+    q_mean   = apply(sim_mat, 1, weighted.mean, w = L_w)
+  )
+  for(q in quantiles){
+    col <- paste0("q_", sprintf("%02d", round(q*100)))
+    bounds[[col]] <- apply(sim_mat, 1, function(row){
+      ord <- order(row); cw <- cumsum(L_w[ord])
+      row[ord][which(cw >= q)[1]]
+    })
+  }
+  bounds
+}
+
+# Plotting functions (keep originals, just pass result)
+plot_glue_bounds <- function(bounds){
+  t_idx <- bounds$datetime
+  y_max <- max(c(bounds$q_obs, bounds$q_95), na.rm=TRUE)*1.1
+  plot(t_idx, bounds$q_obs, type="l", col="black", lwd=1.5,
+       ylim=c(0, y_max), main="GLUE bounds vs observed [m3/s]", xlab="", ylab="m3/s")
+  polygon(c(t_idx, rev(t_idx)), c(bounds$q_05, rev(bounds$q_95)),
+          col=adjustcolor("steelblue", alpha.f=0.3), border=NA)
+  lines(t_idx, bounds$q_best, col="firebrick", lwd=1.5)
+  lines(t_idx, bounds$q_mean, col="steelblue", lwd=1, lty=2)
+  legend("topright", legend=c("Obs","Best","Mean","5-95%"),
+         col=c("black","firebrick","steelblue",adjustcolor("steelblue",0.4)),
+         lwd=c(1.5,1.5,1,8), lty=c(1,1,2,1))
+}
+
+plot_glue_dotty <- function(glue_results, param_bounds){
+  behav    <- glue_results[glue_results$L > 0 & !is.na(glue_results$L), ]
+  nonbehav <- glue_results[is.na(glue_results$L) | glue_results$L == 0, ]
+  n_plots  <- nrow(param_bounds)
+  nr <- ceiling(sqrt(n_plots)); nc <- ceiling(n_plots/nr)
+  par(mfrow=c(nr,nc))
+  for(pn in param_bounds$name){
+    y_max <- if(nrow(behav)>0) max(behav$L, na.rm=TRUE) else 1
+    xlim  <- c(param_bounds$lower[param_bounds$name==pn],
+               param_bounds$upper[param_bounds$name==pn])
+    if(nrow(nonbehav)>0)
+      plot(nonbehav[[pn]], nonbehav$L, xlab=pn, ylab="Likelihood",
+           pch=16, cex=0.4, col="grey70", ylim=c(0.3,y_max), xlim=xlim)
+    else
+      plot(0,0, xlab=pn, ylab="Likelihood", ylim=c(0.3,y_max), xlim=xlim, type="n")
+    if(nrow(behav)>0)
+      points(behav[[pn]], behav$L, pch=16, cex=0.7, col="firebrick")
+    abline(h=0, lty=2, col="grey50")
+  }
+  par(mfrow=c(1,1))
+}
+
+# Helper: tighten bounds from behavioral percentile + margin
+tighten_bounds <- function(pb, runs, prob = c(0.02, 0.98), pad = 1.2){
+  pb2 <- pb
+  for(i in seq_len(nrow(pb))){
+    nm <- pb$name[i]
+    vals <- runs[[nm]]
+    if(length(vals) < 5) next
+    q <- quantile(vals, probs = prob, na.rm = TRUE)
+    if(pb$log[i]){
+      lo <- q[1] / pad
+      up <- q[2] * pad
+    } else {
+      w  <- (q[2] - q[1]) * (pad - 1)/2
+      lo <- q[1] - w
+      up <- q[2] + w
+    }
+    pb2$lower[i] <- max(pb2$lower[i], lo)
+    pb2$upper[i] <- min(pb2$upper[i], up)
+    if(pb2$log[i]) pb2$lower[i] <- max(pb2$lower[i], 1e-7)
+  }
+  pb2
+}
+
+# =============================================================================
+# 9. RUN — Two-stage GLUE
+# =============================================================================
+mdl_template <<- mdl
+outlet_id    <<- OUTLET_ID
+
+
+# -- Stage 1: Wide screen on discharge only -----------------------------------
+cat("\n============= STAGE 1: DISCHARGE SCREENING =============\n")
+Sys.time()
+screen_results <- run_glue(
+  n_samples    = 2000,          # 3k cheap runs to find the sweet spot
+  param_bounds = param_bounds,
+  mdl_template = mdl,
+  obs_sim      = obs_sim,
+  obs_q        = obs_q,
+  pa_obs       = pa_obs,
+  outlet_id    = OUTLET_ID,
+  n_cores      = 7L,
+  seed         = 236L,
+  use_pa       = FALSE,         # ignore PA for now
+  kge_thresh   = -0.4,          # permissive but not garbage
+  include_sz   = FALSE
+)
+Sys.time()
+saveRDS(screen_results, "./glue_results_soils/glue_screen2000_seed236.rds")
+
+
+cat("\nTop 10 Stage-2 behavioral runs:\n")
+best <- screen_results %>% 
+  tibble() %>% 
+arrange(desc(kge))
+
+best_params <- setNames(as.numeric(best[1, param_bounds$name]), param_bounds$name)
+best_sim <- run_model(best_params, mdl, obs_sim,
+                      outlet_id  = OUTLET_ID,
+                      pa_hru_ids = sort(unique(pa_obs$hru_id)),
+                      include_sz = FALSE)
+plot(best_sim$q_out)
+
+######## second round
+# Extract winner
+winner <- screen_results[which.max(screen_results$kge), ]
+winner_params <- setNames(as.numeric(winner[, param_bounds$name]), param_bounds$name)
+best_params
+# Focused bounds around the sweet spot (±1 order of magnitude for logs, ±2× for linear)
+param_bounds_focused <- data.frame(
+  name  = c("t_0","m","t_d","s_rzmax","c_sf","n_ch","v_ch","T_T","C_f","C_wh"),
+  lower = c(0.03,   0.001,  1800,   0.03,   0.05,  0.01,  0.3,  -1.0,  0.5,   0.05),
+  upper = c(5.0,    0.05,   86400,  0.3,    1.5,   0.1,   3.0,   2.0,  10.0,  0.6),
+  log   = c(TRUE,   FALSE,  TRUE,   FALSE,  TRUE,  FALSE, FALSE, FALSE, TRUE,  FALSE),
+  stringsAsFactors = FALSE
+)
+files <- list.files("./glue_results")
+for(i in 1:length(files)){
+  file <- files[i]
+  
+  raw_glue <- readRDS(paste0("./glue_results/",file))
+  screen_glue <- raw_glue[raw_glue$L > 0 & !is.na(raw_glue$L), ]
+  
+  if(i == 1) alldat <- screen_glue
+  if(i > 1) alldat <- rbind(alldat, screen_glue)
+}
+screen_behav <- alldat
+
+# Tighten to 5th–95th percentile of behavioral sets, with a little padding
+pb_focused <- tighten_bounds(param_bounds, screen_behav, prob = c(0.05, 0.95), pad = 1.2)
+cat("\nFocused bounds after Stage 1:\n")
+print(pb_focused)
+
+# -- Stage 2: Focused GLUE with PA --------------------------------------------
+cat("\n============= STAGE 2: FOCUSED GLUE (KGE + PA) =============\n")
+Sys.time()
+glue_results <- run_glue(
+  n_samples    = 300,          # denser sample in reduced space
+  param_bounds = pb_focused,
+  mdl_template = mdl,
+  obs_sim      = obs_sim,
+  obs_q        = obs_q,
+  pa_obs       = pa_obs,
+  outlet_id    = OUTLET_ID,
+  n_cores      = 7L,
+  seed         = 107L,
+  use_pa       = TRUE,
+  kge_thresh   = 0.0,           # must beat the mean predictor
+  include_sz   = FALSE
+)
+saveRDS(glue_results, "./glue_PA_acc_results/glue_screen3000_seed104_PA.rds")
+tk <- readRDS("./glue_PA_acc_results/glue_screen3000_seed104_PA.rds")
+View(tk)
+best <- glue_results %>% 
+  tibble() %>% 
+arrange(desc(kge))
+best
+index <- which(glue_results$kge == max(glue_results$kge, na.rm = TRUE))
+glue_results[which(glue_results$kge == max(glue_results$kge, na.rm = TRUE)),]
+#big_best <- best
+# =============================================================================
+# 10. EVALUATE BEST PARAMETER SET
+# =============================================================================
+cat("\nTop 10 Stage-2 behavioral runs:\n")
+print(head(glue_results[glue_results$L > 0 & !is.na(glue_results$L),
+                        c(param_bounds$name, "L", "kge", "csi", "bias")], 10))
+
+best_params <- setNames(as.numeric(glue_results[index, pb_focused$name]), pb_focused$name)
+best_sim <- run_model(best_params, mdl, obs_sim,
+                      outlet_id  = OUTLET_ID,
+                      pa_hru_ids = sort(unique(pa_obs$hru_id)),
+                      include_sz = FALSE)
+
+# Compose total discharge for plotting
+best_q <- best_sim[,"q_out"]
+
+
+cat("\nBest run evaluation:\n")
+cat("KGE :", kge(best_q, obs_q), "\n")
+cat("Bias:", bias_ratio(best_q, obs_q), "\n")
+
+pa_best <- csi_presence_absence(best_sim, pa_obs)
+if(!is.null(pa_best)){
+  cat(sprintf("CSI=%.3f POD=%.3f FAR=%.3f TP=%d FP=%d FN=%d TN=%d\n ACC=%.3f",
+              pa_best$CSI, pa_best$POD, pa_best$FAR,
+              pa_best$TP, pa_best$FP, pa_best$FN, pa_best$TN, pa_best$accuracy))
+}
+
+# -- Discharge plot --
+plot(merge(obs_q, best_q),
+     main = "Observed vs Simulated discharge [m3/s]",
+     legend.loc = "topright",
+     ylim = c(0, max(c(as.numeric(obs_q), as.numeric(best_q)), na.rm=TRUE)*1.1),
+     col = c("black", "firebrick"))
+plot(merge(best_q, obs_q),
+     main = "Observed vs Simulated discharge [m3/s]",
+     legend.loc = "topright",
+     ylim = c(0, max(c(as.numeric(obs_q), as.numeric(best_q)), na.rm=TRUE)*1.1),
+     col = c("firebrick", "black"))
+
+# -- Dotty plots for focused run --
+#par(mar=c(3,3,3,3))
+
+plot_glue_dotty(tk, pb_focused)
+
+# -- PA site plots --
+for(hid in sort(unique(pa_obs$hru_id))){
+  col_name <- paste0("q_sf_hru", hid)
+  if(!col_name %in% names(best_sim)) next
+  sim_q <- best_sim[, col_name]
+  sub   <- pa_obs[pa_obs$hru_id == hid, ]
+  
+  t_sim <- index(sim_q)
+  ylims <- c(0, max(c(as.numeric(sim_q), FLOW_THRESHOLD*3), na.rm=TRUE))
+  xlims <- c(min(pa_obs$datetime), max(all_23$datetime))
+  
+  plot(t_sim, as.numeric(sim_q), type="l",
+       main = paste("HRU", hid, "— simulated q_sf vs observations 2023"),
+       ylab = "m3/s", xlab = "", col = "steelblue", ylim = ylims
+       ,xlim = xlims
+       )
+  abline(h = FLOW_THRESHOLD, lty = 2, col = "grey40")
+  
+  flowing <- sub[sub$observed == 1, ]
+  dry     <- sub[sub$observed == 0, ]
+  
+  if(nrow(flowing) > 0){
+    t_f <- sort(unique(as.POSIXct(flowing$datetime, tz="UTC")))
+    rect(xleft = head(t_f,-1), xright = tail(t_f,-1),
+         ybottom = 0, ytop = par("usr")[4],
+         col = adjustcolor("green", 0.15), border = NA)
+  }
+  if(nrow(dry) > 0){
+    t_d <- sort(unique(as.POSIXct(dry$datetime, tz="UTC")))
+    rect(xleft = head(t_d,-1), xright = tail(t_d,-1),
+         ybottom = 0, ytop = par("usr")[4],
+         col = adjustcolor("red", 0.1), border = NA)
+  }
+  legend("topright",
+         legend = c("Simulated q_sf", "Flow threshold", "Obs: flowing", "Obs: dry"),
+         col = c("steelblue","grey40", adjustcolor("green",0.4), adjustcolor("red",0.3)),
+         lty = c(1,2,NA,NA), pch = c(NA,NA,15,15), cex=0.8)
+}
+
+## SUMMER 2024
+for(hid in sort(unique(pa_obs$hru_id))){
+  col_name <- paste0("q_sf_hru", hid)
+  if(!col_name %in% names(best_sim)) next
+  sim_q <- best_sim[, col_name]
+  sub   <- pa_obs[pa_obs$hru_id == hid, ]
+  
+  t_sim <- index(sim_q)
+  ylims <- c(0, max(c(as.numeric(sim_q), FLOW_THRESHOLD*3), na.rm=TRUE))
+  xlims <- c(min(all_24$datetime), max(all_24$datetime))
+  
+  plot(t_sim, as.numeric(sim_q), type="l",
+       main = paste("HRU", hid, "— simulated q_sf vs observations 2024"),
+       ylab = "m3/s", xlab = "", col = "steelblue", ylim = ylims
+       ,xlim = xlims
+       )
+  abline(h = FLOW_THRESHOLD, lty = 2, col = "grey40")
+  
+  flowing <- sub[sub$observed == 1, ]
+  dry     <- sub[sub$observed == 0, ]
+  
+  if(nrow(flowing) > 0){
+    t_f <- sort(unique(as.POSIXct(flowing$datetime, tz="UTC")))
+    rect(xleft = head(t_f,-1), xright = tail(t_f,-1),
+         ybottom = 0, ytop = par("usr")[4],
+         col = adjustcolor("green", 0.15), border = NA)
+  }
+  if(nrow(dry) > 0){
+    t_d <- sort(unique(as.POSIXct(dry$datetime, tz="UTC")))
+    rect(xleft = head(t_d,-1), xright = tail(t_d,-1),
+         ybottom = 0, ytop = par("usr")[4],
+         col = adjustcolor("red", 0.1), border = NA)
+  }
+  legend("topright",
+         legend = c("Simulated q_sf", "Flow threshold", "Obs: flowing", "Obs: dry"),
+         col = c("steelblue","grey40", adjustcolor("green",0.4), adjustcolor("red",0.3)),
+         lty = c(1,2,NA,NA), pch = c(NA,NA,15,15), cex=0.8)
+}
+
+
+
+
+# -- Uncertainty bounds --
+n_behav <- sum(glue_results$L > 0, na.rm=TRUE)
+#if(n_behav >= 10){
+  bounds <- glue_uncertainty_bounds(best[1:10,], pb_focused,
+                                    mdl, obs_sim, obs_q,
+                                    outlet_id = OUTLET_ID,
+                                    include_sz = FALSE)
+  plot_glue_bounds(bounds)
+
+```
+
+```{r}
+
+
+default_params <- c(t_0=0.135, m=0.040, t_d=28800, s_rzmax=0.1,
+                    c_sf=0.3,  n_ch=0.05, v_ch=1.0,
+                    T_T=0.0,   C_f=2.5, C_wh=0.1)
+
+test_sim <- run_model(default_params, mdl, obs_sim,
+                      outlet_id  = OUTLET_ID,
+                      pa_hru_ids = sort(unique(pa_obs$hru_id)))
+
+plot(test_sim[,1])
+plot(merge(test_sim[,1], obs_q$Discharge_m3_s),main="Simulated and observed flows",
+     legend.loc='topright')
+
+kge(test_sim$q_out, obs_sim)
+```
+
+```{r}
+test_parms <- data.frame(
+  name = param_bounds$name,
+  value = c(0.135, # t_0
+            0.00698, # m
+            8*60*60, # t_d
+            0.1, # s_rzmax
+            0.5425, #c_sf
+            0.05, #n_ch
+            1, # v_ch
+            0, # T_T
+            2.5, # C_f
+            0.1 # C_wh
+            )
+)
+test_params <- setNames(
+  test_parms$value,
+  test_parms$name
+)
+
+test_sim <- run_model(test_params, mdl, obs_sim,
+                      outlet_id  = OUTLET_ID,
+                      pa_hru_ids = integer(0),   # skip PA to keep it clean
+                      include_sz = FALSE)
+
+plot(merge(test_sim, obs_sim[,1]))
+kge(test_sim[,1], obs_sim)
+```
+
+
+```{r test run model}
+# Load previously created data
+output_defn <- data.frame(name = c("q_sf", "v_sf_rz"),
+                      id = 0,
+                      flux = c("s_sf", "v_sf_rz"),
+                      scale = c(1, -1/900))
+#mdl <- readRDS(file.path(".","dynaGIS","atb_20.rds"))
+#obs <- readRDS(file.path(".","processed","obs.rds"))
+# initialize dynatop object
+
+## determining the initial recharge rate ad setting it in the model
+# I think the same number is the watershed area...
+#r0 <- as.numeric(obs[1, "Streamflow"])#/ 86400
+#r0 <- as.numeric(obs$Streamflow[1])
+ r0 <- as.numeric(obs$Discharge_m3_s[1])#/ sum( sapply( hru, function(x){x$properties["area"]} ) )
+hru <- lapply(hru,function(h){h$initialisation["r_uz_sz_0"] <- r0;h})
+
+## the map input is only needed for visualisation
+ctch_mdl <- dynatop$new(mdl$hru, map = mdl$map
+  )$add_data( obs
+  )$initialise(
+  )$sim(all_req
+  )
+
+
+# Gauge Flows
+sim_gauge <- ctch_mdl$get_output() ## extract the flow as an xts object
+head(sim_gauge)
+plot(sim_gauge[,1],main="Simulated and observed flows",
+     legend.loc='topright')
+plot(merge(sim_gauge, obs$Discharge_m3_s),main="Simulated and observed flows",
+     legend.loc='topright')
+
+
+new_mdl <- ctch_mdl$get_model() ## get the model structure from the dynatop object
+new_mdl[[1]]
+
+```
+
+# PLOT
+```{r}
+# =============================================================================
+# Figure 1: Spatial map of per-sensor accuracy
+# =============================================================================
+
+library(ggplot2)
+library(terra)
+library(tidyverse)
+library(sf)
+
+# ── Compute per-sensor accuracy from best_sim ─────────────────────────────────
+compute_sensor_accuracy <- function(best_sim, pa_obs, 
+                                    threshold = FLOW_THRESHOLD){
+  do.call(rbind, lapply(unique(pa_obs$hru_id), function(hid){
+    col_name <- paste0("q_sf_hru", hid)
+    if(!col_name %in% names(best_sim)) return(NULL)
+    
+    sub <- pa_obs[pa_obs$hru_id == hid, ]
+    if(nrow(sub) == 0) return(NULL)
+    
+    sub_xts <- xts(sub$observed,
+                   order.by = as.POSIXct(sub$datetime, tz = "UTC"))
+    both    <- merge(best_sim[, col_name], sub_xts, join = "inner")
+    if(nrow(both) == 0) return(NULL)
+    
+    sim_bin <- as.integer(as.numeric(both[, 1]) >= threshold)
+    obs_bin <- as.integer(as.numeric(both[, 2]))
+    valid   <- !is.na(sim_bin) & !is.na(obs_bin)
+    sim_bin <- sim_bin[valid]; obs_bin <- obs_bin[valid]
+    
+    TP <- sum(sim_bin == 1L & obs_bin == 1L)
+    FP <- sum(sim_bin == 1L & obs_bin == 0L)
+    FN <- sum(sim_bin == 0L & obs_bin == 1L)
+    TN <- sum(sim_bin == 0L & obs_bin == 0L)
+    n  <- TP + FP + FN + TN
+    
+    data.frame(
+      hru_id   = hid,
+      accuracy = if(n > 0) (TP + TN) / n else NA_real_,
+      CSI      = if((TP+FP+FN) > 0) TP / (TP+FP+FN) else NA_real_,
+      POD      = if((TP+FN) > 0) TP / (TP+FN) else NA_real_,
+      FAR      = if((TP+FP) > 0) FP / (TP+FP) else NA_real_,
+      TP=TP, FP=FP, FN=FN, TN=TN, n=n,
+      pct_flowing = mean(obs_bin, na.rm=TRUE)
+    )
+  }))
+}
+
+sensor_acc <- compute_sensor_accuracy(best_sim, pa_obs)
+
+locs_df <- as.data.frame(stic_locs, geom = "XY") %>%
+  rename(sensor_id = number, lon = x, lat = y) %>%
+  group_by(sensor_id) %>%
+  #slice(2) %>%          # keep first occurrence — or use summarise(lon=mean(lon), lat=mean(lat))
+  ungroup()
+
+spatial_acc <- sensor_hru_key %>%
+  left_join(sensor_acc, by = "hru_id") %>%
+  left_join(locs_df, by = "sensor_id") %>%
+  filter(!is.na(accuracy), !is.na(lon)) %>%
+  distinct(sensor_id, .keep_all = TRUE)  # belt-and-suspenders dedup
+
+# Join sensor accuracy to spatial locations via sensor_hru_map
+# sensor_hru_map has columns: sensor_id, hru_id, hru_name, seg_length, snap_dist
+spatial_acc <- 
+sensor_hru_key %>%
+  left_join(sensor_acc, by = "hru_id") %>%
+  left_join(locs_df) %>% 
+  filter(!is.na(accuracy), !is.na(lon)) 
+
+# Convert to sf for plotting
+spatial_acc_sf <- st_as_sf(spatial_acc,
+                            coords = c("lon", "lat"),
+                            crs = "EPSG:26919") # adjust to your projection
+
+# Watershed outline and channel for basemap
+watershed_sf <- st_as_sf(w3_outline)     # adjust to your outline object
+channel_sf   <- st_as_sf(vect_final)
+
+# ── Plot ──────────────────────────────────────────────────────────────────────
+fig1 <- ggplot() +
+  geom_sf(data = watershed_sf, fill = "grey96", color = "grey60",
+          linewidth = 0.4) +
+  geom_sf(data = channel_sf, color = "steelblue", linewidth = 0.5,
+          alpha = 0.7) +
+  geom_sf(data = spatial_acc_sf,
+          aes(fill = accuracy),
+          shape = 21, color = "white", stroke = 0.6, size = 6) +
+  scale_fill_distiller(
+    palette  = "RdYlGn",
+    direction = 1,
+    limits   = c(0, 1),
+    name     = "Accuracy",
+    labels   = scales::percent_format(accuracy = 1)
+  ) +
+  # scale_size_continuous(
+  #   name   = "Observations",
+  #   range  = c(3, 9),
+  #   breaks = c(50, 200, 500, 1000)
+  # ) +
+  # Label each point with sensor id and accuracy %
+  ggrepel::geom_label_repel(
+    data = spatial_acc_sf,
+    aes(label = paste0(sensor_id, "\n",
+                        scales::percent(accuracy, accuracy = 1)),
+        geometry = geometry),
+    stat         = "sf_coordinates",
+    size         = 2.8,
+    label.size   = 0.2,
+    label.padding = unit(0.15, "lines"),
+    box.padding  = unit(0.4, "lines"),
+    min.segment.length = 0.3,
+    fill         = "white",
+    color        = "grey20"
+  ) +
+  coord_sf() +
+  labs(
+    title    = "Flow presence/absence accuracy by sensor location",
+    subtitle = paste0("Calibration period  ",
+                       format(cal_start, "%Y-%m-%d"), " — ",
+                       format(cal_end,   "%Y-%m-%d")),
+    caption  = paste0("Threshold: ", FLOW_THRESHOLD, " m³/s  |  ",
+                       "n = observations per site")
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title    = element_text(size = 13, face = "bold"),
+    plot.subtitle = element_text(color = "grey50"),
+    legend.position = "right",
+    panel.grid    = element_line(color = "grey92", linewidth = 0.3)
+  )
+
+print(fig1)
+ggsave("fig1_spatial_accuracy.png", fig1, scale = 2,
+       dpi = 300, bg = "white")
+
+# =============================================================================
+# Figure 2: Accuracy through time, aligned with hydrograph
+# =============================================================================
+# Computes a rolling accuracy for each sensor over a sliding window,
+# then stacks them in a panel below the hydrograph.
+
+
+# Hydrograph data
+hydro_df <- data.frame(
+  datetime = index(obs_q),
+  q_obs    = as.numeric(obs_q),
+  q_sim    = as.numeric(best_sim[index(obs_q), "q_out"])
+) %>%
+  filter(datetime >= min(rolling_acc$datetime, na.rm=TRUE),
+         datetime <= max(rolling_acc$datetime, na.rm=TRUE))
+
+# ── Panel 1: hydrograph ───────────────────────────────────────────────────────
+p_hydro <- ggplot(hydro_df, aes(x = datetime)) +
+  geom_line(aes(y = q_obs, color = "Observed"), linewidth = 0.5) +
+  geom_line(aes(y = q_sim, color = "Simulated"), linewidth = 0.5,
+            alpha = 0.8) +
+  scale_color_manual(values = c("Observed" = "black",
+                                 "Simulated" = "firebrick"),
+                     name = NULL) +
+  scale_y_continuous(labels = scales::label_number(suffix = " m³/s",
+                                                    accuracy = 0.001)) +
+  labs(y = "Discharge", x = NULL) +
+  theme_minimal(base_size = 10) +
+  theme(
+    legend.position  = c(0.85, 0.85),
+    legend.key.size  = unit(0.5, "cm"),
+    panel.grid.minor = element_blank(),
+    axis.text.x      = element_blank(),
+    axis.ticks.x     = element_blank(),
+    plot.margin      = margin(t=8, b=0, l=8, r=8)
+  )+xlim(c(window1_start, window1_end))
+
+# ── Panel 2: rolling accuracy per sensor, faceted ────────────────────────────
+
+compute_rolling_accuracy <- function(best_sim, pa_obs,
+                                     threshold    = FLOW_THRESHOLD,
+                                     bin_days     = 14,      # width of each accuracy bin
+                                     join_tol_min = 35){     # max minutes to match obs to sim
+  
+  # ── 1. Convert sim to data frame once — avoid repeated xts indexing ─────────
+  sim_df <- data.frame(
+    datetime = as.POSIXct(index(best_sim), tz = "UTC"),
+    as.data.frame(coredata(best_sim))
+  )
+  
+  # ── 2. Tolerance join: snap each pa_obs row to nearest sim timestep ──────────
+  # Uses findInterval — O(n log n), no loops
+  tol_secs <- join_tol_min * 60
+  
+  pa_joined <- pa_obs %>%
+    mutate(datetime = as.POSIXct(datetime, tz = "UTC")) %>%
+    mutate(
+      # Index of nearest sim timestep
+      idx = findInterval(as.numeric(datetime),
+                         as.numeric(sim_df$datetime)),
+      idx = pmax(1L, pmin(idx, nrow(sim_df)))
+    ) %>%
+    mutate(
+      sim_time = sim_df$datetime[idx],
+      gap_secs = abs(as.numeric(datetime) - as.numeric(sim_time))
+    ) %>%
+    filter(gap_secs <= tol_secs) %>%   # drop obs with no nearby sim timestep
+    mutate(sim_idx = idx)
+  
+  cat(sprintf("PA obs matched: %d / %d (tol = %d min)\n",
+              nrow(pa_joined), nrow(pa_obs), join_tol_min))
+  
+  # ── 3. For each HRU, pull simulated values and compute binned accuracy ───────
+  all_results <- do.call(rbind, lapply(unique(pa_joined$hru_id), function(hid){
+    
+    col_name <- paste0("q_sf_hru", hid)
+    if(!col_name %in% names(sim_df)) return(NULL)
+    
+    sub <- pa_joined %>%
+      filter(hru_id == hid) %>%
+      mutate(
+        sim_q   = sim_df[[col_name]][sim_idx],
+        sim_bin = as.integer(sim_q >= threshold),
+        obs_bin = as.integer(observed),
+        # Assign each obs to a calendar bin
+        bin_start = as.POSIXct(
+          floor(as.numeric(datetime) / (bin_days * 86400)) * (bin_days * 86400),
+          origin = "1970-01-01", tz = "UTC"
+        )
+      ) %>%
+      filter(!is.na(sim_bin), !is.na(obs_bin))
+    
+    if(nrow(sub) == 0) return(NULL)
+    
+    # ── 4. Summarise per bin — fully vectorized, no inner loop ─────────────────
+    sub %>%
+      group_by(hru_id, bin_start) %>%
+      summarise(
+        TP       = sum(sim_bin == 1L & obs_bin == 1L),
+        FP       = sum(sim_bin == 1L & obs_bin == 0L),
+        FN       = sum(sim_bin == 0L & obs_bin == 1L),
+        TN       = sum(sim_bin == 0L & obs_bin == 0L),
+        n_obs    = n(),
+        .groups  = "drop"
+      ) %>%
+      mutate(
+        accuracy = (TP + TN) / (TP + FP + FN + TN),
+        CSI      = ifelse((TP+FP+FN) > 0, TP / (TP+FP+FN), NA_real_),
+        POD      = ifelse((TP+FN)    > 0, TP / (TP+FN),    NA_real_),
+        datetime = bin_start + (bin_days * 86400 / 2)  # bin midpoint for plotting
+      ) %>%
+      filter(n_obs >= 3)   # skip bins with too few observations to be meaningful
+  }))
+  
+  all_results
+}
+
+# ── Usage ─────────────────────────────────────────────────────────────────────
+rolling_acc <- compute_rolling_accuracy(
+  best_sim     = best_sim,
+  pa_obs       = pa_obs,
+  threshold    = FLOW_THRESHOLD,
+  bin_days     = 14,       # 2-week bins — reduce to 7 for finer resolution
+  join_tol_min = 20        # 20-min tolerance handles both your 10-min and 30-min series
+)
+# Sort sensors by upstream-to-downstream order (hru_id ascending)
+rolling_acc <- rolling_acc %>% 
+  left_join(sensor_hru_map %>% select(sensor_id, hru_id),
+            by = "hru_id") %>%
+  mutate(label = paste0("Site ", sensor_id, " (HRU ", hru_id, ")")) %>%  # create first
+  mutate(label = fct_reorder(label, hru_id))                              # then reorder
+
+
+# Tag each row with which period it belongs to
+window1_start <- ymd("2023-07-01", tz = "UTC")
+window1_end   <- ymd("2023-11-30", tz = "UTC")
+window2_start <- as.POSIXct("2024-05-01", tz = "UTC")
+window2_end   <- as.POSIXct("2024-07-31", tz = "UTC")
+tag_period <- function(df){
+  df %>% mutate(
+    period = case_when(
+      datetime >= window1_start & datetime <= window1_end ~ "Summer–Fall 2023",
+      datetime >= window2_start & datetime <= window2_end ~ "Summer 2024",
+      TRUE ~ NA_character_
+    )
+  ) %>% filter(!is.na(period))
+}
+
+rolling_acc <- tag_period(rolling_acc)
+hydro_df       <- tag_period(hydro_df)
+
+# Then add to both p_hydro and p_acc:
+# + facet_wrap(~ period, scales = "free_x", nrow = 1)
+# + scale_x_datetime(date_labels = "%b", date_breaks = "1 month")
+
+p_acc <- ggplot(rolling_acc, aes(x = datetime, y = accuracy)) +
+  # Shaded "good" zone
+  annotate("rect", xmin=-Inf, xmax=Inf, ymin=0.7, ymax=1,
+           fill = "green", alpha = 0.04) +
+  geom_hline(yintercept = 0.5, linetype = "dashed",
+             color = "grey70", linewidth = 0.4) +
+  geom_line(aes(color = accuracy, group = 1), linewidth = 0.6,
+            na.rm = TRUE) +
+  geom_point(aes(color = accuracy), size = 0.8, na.rm = TRUE) +
+  scale_color_distiller(
+    palette   = "RdYlGn",
+    direction = 1,
+    limits    = c(0, 1),
+    name      = "Accuracy",
+    labels    = scales::percent_format(accuracy = 1),
+    guide     = guide_colorbar(barwidth = 0.5, barheight = 5)
+  ) +
+  scale_y_continuous(
+    limits = c(0, 1),
+    labels = scales::percent_format(accuracy = 1),
+    breaks = c(0, 0.5, 1)
+  ) +
+  scale_x_datetime(date_labels = "%b %Y", date_breaks = "2 months",
+                   limits = c(window1_start, window1_end)) +
+  facet_wrap(~ label, ncol = 1, strip.position = "right") +
+  labs(y = paste0("Rolling accuracy\n(", 14, "-day window)"), x = NULL) +
+  theme_minimal(base_size = 9) +
+  theme(
+    strip.text       = element_text(size = 8, color = "grey40"),
+    panel.grid.minor = element_blank(),
+    panel.spacing    = unit(0.15, "lines"),
+    legend.position  = "right",
+    plot.margin      = margin(t=0, b=8, l=8, r=8)
+  )
+
+# ── Combine with patchwork ────────────────────────────────────────────────────
+library(patchwork)
+
+n_sensors  <- length(unique(rolling_acc$hru_id))
+hydro_h    <- 2      # inches for hydrograph panel
+sensor_h   <- 0.9   # inches per sensor panel
+
+fig2 <- p_hydro / p_acc +
+  plot_layout(
+    heights = c(hydro_h, sensor_h * n_sensors)
+  ) +
+  plot_annotation(
+    title   = "Rolling flow presence/absence accuracy through time",
+    subtitle = paste0("14-day sliding window  |  threshold = ",
+                       FLOW_THRESHOLD, " m³/s"),
+    theme = theme(
+      plot.title    = element_text(size = 13, face = "bold"),
+      plot.subtitle = element_text(size = 10, color = "grey50")
+    )
+  )
+fig2
+print(fig2)
+ggsave("fig2_temporal_accuracy.png", fig2,
+       width  = 10,
+       height = hydro_h + sensor_h * n_sensors + 1.5,
+       dpi    = 300, bg = "white")
+```
+
+```{r}
+compute_rolling_accuracy <- function(best_sim, pa_obs,
+                                     threshold    = FLOW_THRESHOLD,
+                                     bin_days     = 14,      # width of each accuracy bin
+                                     join_tol_min = 20){     # max minutes to match obs to sim
+  
+  # ── 1. Convert sim to data frame once — avoid repeated xts indexing ─────────
+  sim_df <- data.frame(
+    datetime = as.POSIXct(index(best_sim), tz = "UTC"),
+    as.data.frame(coredata(best_sim))
+  )
+  
+  # ── 2. Tolerance join: snap each pa_obs row to nearest sim timestep ──────────
+  # Uses findInterval — O(n log n), no loops
+  tol_secs <- join_tol_min * 60
+  
+  pa_joined <- pa_obs %>%
+    mutate(datetime = as.POSIXct(datetime, tz = "UTC")) %>%
+    mutate(
+      # Index of nearest sim timestep
+      idx = findInterval(as.numeric(datetime),
+                         as.numeric(sim_df$datetime)),
+      idx = pmax(1L, pmin(idx, nrow(sim_df)))
+    ) %>%
+    mutate(
+      sim_time = sim_df$datetime[idx],
+      gap_secs = abs(as.numeric(datetime) - as.numeric(sim_time))
+    ) %>%
+    filter(gap_secs <= tol_secs) %>%   # drop obs with no nearby sim timestep
+    mutate(sim_idx = idx)
+  
+  cat(sprintf("PA obs matched: %d / %d (tol = %d min)\n",
+              nrow(pa_joined), nrow(pa_obs), join_tol_min))
+  
+  # ── 3. For each HRU, pull simulated values and compute binned accuracy ───────
+  all_results <- do.call(rbind, lapply(unique(pa_joined$hru_id), function(hid){
+    
+    col_name <- paste0("q_sf_hru", hid)
+    if(!col_name %in% names(sim_df)) return(NULL)
+    
+    sub <- pa_joined %>%
+      filter(hru_id == hid) %>%
+      mutate(
+        sim_q   = sim_df[[col_name]][sim_idx],
+        sim_bin = as.integer(sim_q >= threshold),
+        obs_bin = as.integer(observed),
+        # Assign each obs to a calendar bin
+        bin_start = as.POSIXct(
+          floor(as.numeric(datetime) / (bin_days * 86400)) * (bin_days * 86400),
+          origin = "1970-01-01", tz = "UTC"
+        )
+      ) %>%
+      filter(!is.na(sim_bin), !is.na(obs_bin))
+    
+    if(nrow(sub) == 0) return(NULL)
+    
+    # ── 4. Summarise per bin — fully vectorized, no inner loop ─────────────────
+    sub %>%
+      group_by(hru_id, bin_start) %>%
+      summarise(
+        TP       = sum(sim_bin == 1L & obs_bin == 1L),
+        FP       = sum(sim_bin == 1L & obs_bin == 0L),
+        FN       = sum(sim_bin == 0L & obs_bin == 1L),
+        TN       = sum(sim_bin == 0L & obs_bin == 0L),
+        n_obs    = n(),
+        .groups  = "drop"
+      ) %>%
+      mutate(
+        accuracy = (TP + TN) / (TP + FP + FN + TN),
+        CSI      = ifelse((TP+FP+FN) > 0, TP / (TP+FP+FN), NA_real_),
+        POD      = ifelse((TP+FN)    > 0, TP / (TP+FN),    NA_real_),
+        datetime = bin_start + (bin_days * 86400 / 2)  # bin midpoint for plotting
+      ) %>%
+      filter(n_obs >= 3)   # skip bins with too few observations to be meaningful
+  }))
+  
+  all_results
+}
+
+# ── Usage ─────────────────────────────────────────────────────────────────────
+rolling_acc <- compute_rolling_accuracy(
+  best_sim     = best_sim,
+  pa_obs       = pa_obs,
+  threshold    = FLOW_THRESHOLD,
+  bin_days     = 14,       # 2-week bins — reduce to 7 for finer resolution
+  join_tol_min = 20        # 20-min tolerance handles both your 10-min and 30-min series
+)
+```
+

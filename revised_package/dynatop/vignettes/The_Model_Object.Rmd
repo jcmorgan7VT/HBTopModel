@@ -1,0 +1,215 @@
+---
+title: "The Model Object"
+output:
+  bookdown::html_document2:
+    base_format: rmarkdown::html_vignette
+    number_sections: false
+    toc: true
+    toc_depth: 2
+pkgdown:
+  as_is: true
+vignette: >
+  %\VignetteIndexEntry{The Model Object}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>"
+)
+```
+The purpose of this vignette is to document the structure of a Dynamic
+TOPMODEL model 'object'; that is the structure of the model that can be generated in
+the [dynatopGIS](https://waternumbers.github.io/dynatopGIS/) package and is
+used in calls to the ```dynatop``` function in the current package. Currently
+the model is stored as an R variable of the list class.
+
+This should be read alongside the ["Getting
+Started"](dynatop.html) vignette which demonstrates the manipulation and use
+of a model object.
+
+The model structure will be documented with reference to the model in the test
+catchment data supplied with the package. This can be loaded with
+
+```{r, setup}
+library(dynatop)
+data("Swindale")
+model <- Swindale$model
+```
+
+The top level of the model contains the following elements:
+
+```{r model_parts}
+names(model)
+```
+
+We consider each of these separately.
+
+## map
+
+The `map` element gives the path to the raster map of HRU locations which can
+be used in the creation of a new ```dynatop``` object to enable plotting of
+the state variables.
+
+## output_flux
+
+The `output_flux` element contains a data frame which defines the series to be output
+during a simulation. This is passed to the `sim` method of the ```dynatop```
+object. The columns of `output_flux` are given in Table
+\@ref(tab:output-flux).
+
+A single output value for each series is given for each data time step. If
+multiple rows of the data frame contain the same name the values of the series are summed. If the simulation is run with substeps then the outputs are
+averaged over the sub steps. Note that strictly only "q_sf", "q_sf_in", "q_sz"
+and "q_sz_in" are fluxes, the remainder are volumes.
+
+| Name    | Class   | Unit  | Description                                                                                                                              |
+| ---     | ---     | ---   | -----                                                                                                                                    |
+| name      | character | -   | name given to the output series |
+| id    | integer | - | id of the HRU from which the output is to be taken |
+| flux | character | -    | Flux to be recorded. One of "precip", "pet", "aet", "q_sf", "q_sf_in", "q_sz", "q_sz_in", "s_sf", "s_rz", "s_uz", "s_sz", "v_sf_rz", "v_rz_uz" or "v_uz_sz". |
+
+Table: (\#tab:output-flux) Description of `output_flux` data frame columns
+
+## hru
+
+The `hru` contains a list, where each list element is the description of a
+single HRU. Each HRU is described by a list containing the elements outlined
+in Table \@ref(tab:model-table) and described in more detail in the sections
+below. In many cases the naming of the variables within the vectors relates to
+the variables names in the [HRU vignette](HRU.html) as given in
+[implementation document](Notes_on_the_implementation_of_Dynamic_TOPMODEL.html).
+
+| Name              | Class   | Description                                              |
+|-------------------|---------|----------------------------------------------------------|
+| id                | integer | The unique ID of the HRU                                 |
+| states            | numeric | Named numeric vector of states                           |
+| properties        | numeric | Named numeric vector of properties                       |
+| sf                | list    | Description of the surface zone solution                 |
+| rz                | list    | Description of the surface zone solution                 |
+| uz                | list    | Description of the unsaturated zone solution             |
+| sz                | list    | Description of the saturated solution                    |
+| sf_flow_direction | list    | Description of the surface zone outflows to other HRUs   |
+| sz_flow_direction | list    | Description of the saturated zone outflows to other HRUs |
+| initialisation    | numeric | Named numeric vector of initialisation parameters        |
+| precip            | list    | Description of the precipitation input to the HRU        |
+| pet               | list    | Description of the PET input to the HRU                  |
+| class             | list    | Classification information from dynatopGIS               |
+
+Table: (\#tab:model-table) Description of top-level model components
+
+### states
+
+A numeric vector of states, see Table \@ref(tab:states), such as
+
+```{r}
+model$hru[[1]]$states
+```
+
+| Name | Class   | Unit | Description                                   |
+|------|---------|------|-----------------------------------------------|
+| s_sf | numeric | m    | Surface Zone storage volume per unit area     |
+| s_rz | numeric | m    | Root Zone storage volume per unit area        |
+| s_uz | numeric | m    | Unsaturated Zone storage volume per unit area |
+| s_sz | numeric | m    | Saturated Zone storage deficit per unit area  |
+
+Table: (\#tab:states) Description of numeric state vector
+
+### properties
+
+A numeric vector of properties, see Table \@ref(tab:prop) such as
+
+```{r}
+model$hru[[1]]$properties
+```
+
+| Name     | Class   | Unit  | Description                 |
+|----------|---------|-------|-----------------------------|
+| area     | numeric | m$^2$ | Surface area of the HRU     |
+| width    | numeric | m     | Width of the HRU            |
+| Dx       | numeric | m     | Effective length of the HRU |
+| gradient | numeric | -     | Average gradient            |
+
+Table: (\#tab:prop) Description of numeric state vector
+
+### sf, rz, uz,& sz
+
+The list variables describe the surface (sf), root zone (rz), unsaturated zone
+(uz) ans saturated zone (sz) representations. Each list contains a character
+vector `type` giving the type of representation and `parameters` a numeric
+vector of names parameters. For example
+
+```{r}
+model$hru[[1]]$sz
+```
+
+The description of the types and parameters are given in the [HRU
+vignette](HRU.html)
+
+### sf_flow_direction & sz_flow_direction
+
+Each of these lists contains two vectors as specified in Table
+\@ref(tab:flow). In the special case that no outflow goes to another HRU, such
+as at the outlet of the catchment, the description of the flow direction takes
+the following form:
+
+```{r}
+model$hru[[1]]$sf_flow_direction
+```
+| Name | Class   | Unit | Description                                                                                    |
+|------|---------|------|------------------------------------------------------------------------------------------------|
+| id   | integer | -    | Vector of id values for the HRUs to which the flow is going. Must be lower then the current id |
+| frc  | numeric | 0-1  | Fraction of the flow which goes from the corresponding id. Must sum to 1                       |
+
+Table: (\#tab:flow) Description of flow direction list variables
+
+
+### initialisation
+
+The named numeric vector contains the values to use in the initialisation of
+the HRU as given in Table \@ref(tab:init) and shown below.
+
+```{r}
+model$hru[[1]]$initialisation
+```
+
+| Name     | Class   | Unit | Description                                                                |
+|----------|---------|------|----------------------------------------------------------------------------|
+| s_rz0    | numeric | 0-1  | Initial root zone depth expressed as fraction of maximum depth (parameter) |
+| r_uz_sz0 | numeric | m/s  | Initial recharge to the saturated zone per unit area (parameter)           |
+
+Table: (\#tab:init) Description of initialisation values
+
+### precip & pet
+
+These list contain the description of the precipitation (precip) and PET
+(pet) inputs used by the HRU. Each list takes the form of two vectors as given
+in Table \@ref(tab:input) and shown below. From this the average input value
+is calculated.
+
+```{r}
+model$hru[[1]]$precip
+```
+
+| Name | Class     | Unit | Description                                                                      |
+|------|-----------|------|----------------------------------------------------------------------------------|
+| name | character | -    | Character vector containing the names of the input series to use.                |
+| frc  | numeric   | 0-1  | The fraction of the HRU area for which the input series is valid. Must sum to 1. |
+
+Table: (\#tab:input) Description of precip and pet lists
+
+
+### class
+
+Class is a list variable. while not used in the simulation code it can be used
+to store information that might be of use in, for example, determining which
+parameter values to apply to the HRU (see the ["Getting Started"](dynatop.html) vignette for
+an example).
+
+Currently if the model is constructed using 
+[dynatopGIS](https://waternumbers.github.io/dynatopGIS/) `class` is populated
+based on the classification and channel data used in the model build process,
+but the format of this is subject to change.
+
