@@ -1056,6 +1056,8 @@ ctch$add_layer(soil_ext, layer_name = "soil")
 ## simple equally spaced cuts of TWI
 ctch$classify("atb_20","atb",20)
 ctch$plot_layer("atb_20")
+ctch$plot_layer("soil")
+
 
 ctch$combine_classes("atb20_soil",c("atb_20","soil"))
 ctch$plot_layer("atb20_soil")
@@ -1296,6 +1298,11 @@ vect_final <- vect("./7th_attempt/processed/channel.shp")
 ## TEST RUN
 ```{r test run model}
 
+output_defn <- data.frame(name = c("s_sf", "q_sf", "s_sz"),
+                      id = c(57, 57, 57),
+                      flux = c("s_sf", "q_sf", "s_sz"),
+                      scale = c(1, 1, -1))
+
 # set initial conditions
 r0 <- as.numeric(obs$Discharge_m3_s[1])/ sum( sapply( mdl$hru, function(x){x$properties["area"]} ) )
 mdl$hru <- lapply(mdl$hru,function(h){h$initialisation["r_uz_sz_0"] <- r0;h})
@@ -1305,7 +1312,7 @@ Sys.time()
 ctch_mdl <- dynatop$new(mdl$hru, map = mdl$map
   )$add_data( obs
   )$initialise(
-  )$sim(mdl$output_flux, sub_step = 3600
+  )$sim(output_defn, sub_step = 3600
   )
 
 
@@ -1314,12 +1321,32 @@ mdl_after <- ctch_mdl$get_model()
 mdl_after[[1]]$states
 # Gauge Flows
 sim_gauge <- ctch_mdl$get_output() ## extract the flow as an xts object
-sim_gauge[1:50,]
-plot(sim_gauge[,1],main="Simulated and observed flows",
+plot(sim_gauge[-1:-1000,3],main="Simulated and observed flows",
      legend.loc='topright',
      xlim = c( as.POSIXct("2020-01-03", tz = "UTC")))
-plot(merge(sim_gauge[,1], obs$Discharge_m3_s),main="Simulated and observed flows",
-     legend.loc='topright')
+
+plot(merge(sim_gauge[-1:-1000,1], sim_gauge[-1:-1000,3]),main="Simulated and observed flows",
+     legend.loc='topright',
+     color = c("black", "red"))
+
+
+plot(x = as.numeric(sim_gauge$s_sf[-1:-1000]), y = as.numeric(sim_gauge$q_sf[-1:-1000]))
+just_57 <- pa_obs %>% 
+  filter(hru_id == 57) %>% 
+  select(-hru_id) 
+just_57_xts <- just_57 %>% 
+  select(-datetime) %>% 
+  xts(order.by = as.POSIXct(just_57$datetime))
+
+# Define start and end times
+xmin1 <- as.POSIXct(index(just_57_xts))
+xmax1 <- as.POSIXct(index(just_57_xts))
+
+# Use xlim in the plot function
+plot(myData, xlim = c(start_time, end_time))
+plot(merge(sim_gauge[-1:-30000,3], just_57_xts),main="Simulated and observed flows",
+     legend.loc='topright',
+     color = c("black", "red"))
 
 kge(sim_gauge[,1], obs$Discharge_m3_s)
 ```
@@ -1391,913 +1418,7 @@ write_csv(pa_obs, "./7th_attempt/pa_obs.csv")
 
 # PARAMETERIZE
 
-```{r param attempt 3}
-# =============================================================================
-# 1. LOAD MODEL AND DATA
-# =============================================================================
-# mdl <- readRDS(file.path(".", "hb_data", "dynaGIS", "atb_20.rds"))
-# obs <- readRDS(file.path(".", "processed", "obs.rds"))
-
-# -- Windows ------------------------------------------------------------------
-SPIN_DAYS    <- 90                    # spin-up length before cal_start
-cal_start    <- as.POSIXct(start, tz = "UTC")
-cal_end      <- as.POSIXct(end, tz = "UTC")
-sim_start    <- cal_start - SPIN_DAYS*24
-
-obs_sim      <- obs[index(obs) >= sim_start & index(obs) <= cal_end, ]
-obs_eval     <- obs[index(obs) >= cal_start & index(obs) <= cal_end, ]
-obs_q        <- obs_eval[, "Discharge_m3_s"]   # keep as xts for time alignment
-
-# -- Confirm outlet HRU --------------------------------------------------------
-for(ii in seq_along(mdl$hru)){
-  h <- mdl$hru[[ii]]
-  if(length(h$sf_flow_direction$id) == 0 & length(h$sz_flow_direction$id) == 0)
-    cat("Outlet HRU id:", h$id, "| is channel:", !is.na(h$class$endNode), "\n")
-}
-OUTLET_ID <- 0L
-
-# =============================================================================
-# 2. FLOW PRESENCE/ABSENCE OBSERVATIONS
-# =============================================================================
-#all_24 <- read_csv("/Users/johnmorgan/Documents/VT Research/HBTopModel/STIC_Synthesis/02_BinaryMatrix/Binary_hb_w3.csv")
-all_24 <- read_csv("/Users/johnmorgan/Documents/VT Research/HBTopModel/STIC_Synthesis/all_24.csv") %>% 
-  filter(wshed == "W3") %>% 
-  select(datetime, wetdry, number, lat, long) %>% 
-  filter(number %in% sensor_hru_key$sensor_id)
-
-
-
-all_23 <- read_csv("/Users/johnmorgan/Documents/VT Research/HBTopModel/STIC_Synthesis/all_23.csv") %>% 
-  filter(wshed == "W3") %>% 
-  select(datetime, wetdry, ID, lat, long) %>% 
-  rename(number = ID) %>% 
-  filter(number %in% sensor_hru_key$sensor_id)
-
-
-
-stic_locs <- all_23 %>% 
-  bind_rows(all_24) %>%
-  select(number, lat, long) %>%
-  distinct() %>%
-  vect(geom = c("long", "lat"), crs = "EPSG:4326") %>%
-  project("EPSG:26919")
-
-all_out <- do.call(rbind, lapply(seq_len(nrow(stic_locs)), function(i){
-  dist_table <- distance(stic_locs[i,], vect_final)
-  idx        <- which.min(dist_table)[1]
-  data.frame(ID         = stic_locs[i,]$number,
-             channel_ID = vect_final[idx,]$name,
-             dist       = min(dist_table))
-}))
-
-sensor_hru_key
-pa_obs <- 
-  all_23 %>% 
-  bind_rows(all_24) %>%
-  filter(number %in% sensor_hru_key$sensor_id) %>%
-  select(datetime, number, wetdry) %>%
-  rename(ID = number) %>%
-  left_join(sensor_hru_key, by = c("ID" = "sensor_id")) %>%
-  #left_join(chosen, by = "ID", relationship = "many-to-one") %>%
-  mutate(
-    observed = as.integer(case_when(wetdry == "wet" ~ 1, wetdry == "dry" ~ 0)),
-    datetime = as.POSIXct(datetime, tz = "UTC")
-  ) %>%
-  select(hru_id, datetime, observed) %>%
-  filter(datetime >= cal_start, datetime <= cal_end,
-         !is.na(hru_id), !is.na(observed))
-
-cat("PA sites:", sort(unique(pa_obs$hru_id)), "\n")
-cat("PA obs:", nrow(pa_obs), "| flowing:", sum(pa_obs$observed == 1),
-    "| dry:", sum(pa_obs$observed == 0), "\n")
-
-# Threshold for simulated "flowing" (m3/s). Adjust after Stage 1 diagnostics.
-FLOW_THRESHOLD <- 1e-4   # 0.1 L/s is more defensible than 1e-8 for small streams
-
-# =============================================================================
-# 3. PARAMETER SPACE (Modified for 3 soil groups)
-# =============================================================================
-param_bounds <- data.frame(
-  name  = c("t_0_1", "t_0_2", "t_0_3", 
-            "m_1",   "m_2",   "m_3",   
-            "t_d_1", "t_d_2", "t_d_3", 
-            "s_rzmax", "c_sf", "T_T", "C_f"),
-            
-  # Lower bounds
-  lower = c(0.5,   0.1,   0.01,   # t_0: Group 1 (high), Group 2 (mod), Group 3 (low)
-            0.01,  0.02,  0.001,  # m:   Group 1 (mod), Group 2 (high/deep), Group 3 (low/shallow)
-            3600,  43200, 3600,   # t_d: Group 1 (fast), Group 2 (slow), Group 3 (very fast)
-            0.03,  0.01, -2.0,  0.1), # Other parameters (from original framework)
-            
-  # Upper bounds
-  upper = c(5.0,   1.0,   0.5,    # t_0 
-            0.03,  0.05,  0.01,   # m   
-            28800, 172800,14400,  # t_d 
-            0.3,   0.5,   2.0,  5.0), # Other parameters
-            
-  # Log-uniform sampling flags
-  log   = c(TRUE,  TRUE,  TRUE,   # t_0 (usually spans orders of magnitude)
-            FALSE, FALSE, FALSE,  # m (usually sampled uniformly within its narrow range)
-            TRUE,  TRUE,  TRUE,   # t_d (spans orders of magnitude)
-            FALSE, TRUE,  FALSE, TRUE),
-            
-  stringsAsFactors = FALSE
-)
-
-n_params <- nrow(param_bounds)
-
-strip_obs <- function(obs_xts){
-  drop <- c("Discharge_m3_s", "Discharge_ls", "Discharge")
-  keep <- !(names(obs_xts) %in% drop)
-  obs_xts[, keep]
-}
-
-# =============================================================================
-# 4. MODEL RUNNER (Modified)
-# =============================================================================
-run_model <- function(params,
-                      #mdl_template,
-                      obs,
-                      outlet_id  = 0L,
-                      pa_hru_ids = sort(unique(pa_obs$hru_id)),
-                      sub_step   = 3600,
-                      include_sz = FALSE){        
-  
-  mdl_template <- readRDS( file.path(".", "7th_attempt", "dynaGISgoodChannel7","model_ready.rds"))
-  hru <- mdl_template$hru
-
-  obs_input  <- strip_obs(obs)
-  total_area <- sum(sapply(hru, function(h) h$properties["area"]))
-  
-  q_init <- as.numeric(na.omit(obs$Discharge_m3_s))[1]
-  if(!is.finite(q_init) || q_init <= 0) q_init <- 1e-5
-  
-  # --- CONSTANTS ---
-  CONSTANT_V_CH <- 1.0  # Adjust your fixed channel velocity here
-  #CONSTANT_N_CH <- 0.05 # Adjust your fixed Manning's n (if using kinematic)
-  CONSTANT_C_WH <- 0.2  # Adjust your fixed water holding capacity
-  
-  for(ii in seq_along(hru)){
-    is_channel <- isTRUE(!is.na(hru[[ii]]$class$endNode))
-    
-    if(!is_channel){
-      # Fetch the soil index (1, 2, or 3) from the map generated earlier
-      s_idx <- hru_soil_map$soil_idx[hru_soil_map$hru_index == ii]
-      
-      hru[[ii]]$sz$parameters["t_0"]     <- params[paste0("t_0_", s_idx)]
-      hru[[ii]]$sz$parameters["m"]       <- params[paste0("m_", s_idx)]
-      hru[[ii]]$uz$parameters["t_d"]     <- params[paste0("t_d_", s_idx)]
-      hru[[ii]]$rz$parameters["s_rzmax"] <- params["s_rzmax"]
-      
-      if(hru[[ii]]$sf$type == "cnst"){
-        hru[[ii]]$sf$parameters["c_sf"]  <- params["c_sf"]
-      }
-    #} else {
-      #hru[[ii]]$sz$parameters["t_0"]     <- 0.001
-      #hru[[ii]]$sz$parameters["m"]       <- 0.001        
-      #hru[[ii]]$rz$parameters["s_rzmax"] <- 0.001
-      
-      # Apply Constants
-      if(hru[[ii]]$sf$type == "cnst"){
-        hru[[ii]]$sf$parameters["c_sf"]  <- CONSTANT_V_CH
-      } else if(hru[[ii]]$sf$type == "kin"){
-        hru[[ii]]$sf$parameters["n"]     <- CONSTANT_N_CH
-        hru[[ii]]$sf$parameters["t_raf"] <- 999.9
-        hru[[ii]]$sf$parameters["s_raf"] <- 0
-      }
-    }
-    
-    # Snow parameters (C_wh is constant)
-    hru[[ii]]$snow$parameters["T_T"]  <- params["T_T"]
-    hru[[ii]]$snow$parameters["C_f"]  <- params["C_f"]
-    hru[[ii]]$snow$parameters["C_wh"] <- CONSTANT_C_WH
-    
-    # Initial conditions
-    s_rzmax_val <- if(!is_channel) as.numeric(params["s_rzmax"]) else 0.001
-    hru[[ii]]$initialisation["s_rz_0"]    <- 0.7
-    hru[[ii]]$initialisation["r_uz_sz_0"] <- q_init / total_area
-    
-    # if("s_sz_0" %in% names(hru[[ii]]$initialisation)){
-    #   hru[[ii]]$initialisation["s_sz_0"] <- 0.001
-    # }
-  }
-  
-  pa_ids <- unique(pa_hru_ids)
-  out_rows <- data.frame(
-    name  = c("q_out", if(include_sz) "q_out_sz", paste0("q_sf_hru", pa_ids)),
-    id    = c(outlet_id, if(include_sz) outlet_id, pa_ids),
-    flux  = c("q_sf", if(include_sz) "q_sz", rep("q_sf", length(pa_ids))),
-    scale = 1.0,
-    stringsAsFactors = FALSE
-  )
-  
-  result <- tryCatch({
-    cm <- dynatop$new(hru, map = mdl_template$map)
-    cm$add_data(obs_input)
-    cm$initialise()
-    cm$sim(out_rows, sub_step = sub_step)$get_output()
-  }, error = function(e){
-    warning("run_model error: ", conditionMessage(e))
-    NULL
-  })
-  return(result)
-}
-
-default_params <- c("t_0_1" = 0.135, "t_0_2"= 0.135, "t_0_3"= 0.135, 
-            "m_1"=0.040,   "m_2"=0.040,   "m_3"=0.040,   
-            "t_d_1"=28800, "t_d_2"=28800, "t_d_3"=28800, 
-            "s_rzmax"=0.1, "c_sf"=0.3, "T_T"=0.0, "C_f"=0.002)
-run_model(default_params,
-          obs)
-# =============================================================================
-# 5. DIAGNOSTIC (revised)
-# =============================================================================
-run_diagnostic <- function(mdl, obs_sim, obs_eval, pa_obs,
-                           outlet_id = 0L, sub_step = 900, include_sz = FALSE){
-  
-  obs_input <- strip_obs(obs_sim)
-  nms <- c("q_sf_out", "s_sf_out", "s_sz_out", "q_sz_out")
-  if(include_sz) nms <- c(nms, "q_total_out")
-  
-  diag_rows <- data.frame(
-    name  = c("q_sf_out", "s_sf_out", "s_sz_out", "q_sz_out"),
-    id    = outlet_id,
-    flux  = c("q_sf", "s_sf", "s_sz", "q_sz"),
-    scale = 1.0,
-    stringsAsFactors = FALSE
-  )
-  
-  cm <- dynatop$new(mdl$hru, map = mdl$map)
-  cm$add_data(obs_input)
-  cm$initialise()
-  diag_out <- cm$sim(diag_rows, sub_step = sub_step)$get_output()
-  
-  # Evaluate only over cal window
-  eval_idx <- index(diag_out) >= index(obs_eval)[1] & index(diag_out) <= tail(index(obs_eval),1)
-  q_sf_win <- diag_out[eval_idx, "q_sf_out"]
-  q_sz_win <- diag_out[eval_idx, "q_sz_out"]
-  
-  q_tot <- if(include_sz) q_sf_win + q_sz_win else q_sf_win
-  
-  cat("=== Diagnostics (evaluation window) ===\n")
-  cat("q_sf range (m3/s):", signif(range(as.numeric(q_sf_win)), 3), "\n")
-  if(include_sz) cat("q_sz range (m3/s):", signif(range(as.numeric(q_sz_win)), 3), "\n")
-  cat("Sim Total range  :", signif(range(as.numeric(q_tot)), 3), "\n")
-  cat("obs_q range      :", signif(range(as.numeric(obs_eval$Discharge_m3_s), na.rm=TRUE), 3), "\n")
-  cat("Bias (sim/obs)   :", signif(mean(q_tot, na.rm=TRUE)/mean(obs_eval$Discharge_m3_s, na.rm=TRUE), 3), "\n")
-  
-  s_sf_vals <- as.numeric(diag_out[,"s_sf_out"])
-  if(tail(s_sf_vals,1) > 10 * s_sf_vals[1] + 1){
-    cat("WARNING: s_sf growing unboundedly.\n")
-  } else {
-    cat("s_sf appears stable.\n")
-  }
-  
-  # PA quick look
-  pa_ids <- sort(unique(pa_obs$hru_id))
-  pa_rows <- data.frame(
-    name  = paste0("q_sf_hru", pa_ids),
-    id    = pa_ids,
-    flux  = "q_sf",
-    scale = 1.0,
-    stringsAsFactors = FALSE
-  )
-  cm2 <- dynatop$new(mdl$hru, map = mdl$map)
-  cm2$add_data(obs_input)
-  cm2$initialise()
-  pa_out <- cm2$sim(pa_rows, sub_step = sub_step)$get_output()
-  
-  cat("\n=== PA site q_sf (during eval window) ===\n")
-  for(hid in pa_ids){
-    col <- paste0("q_sf_hru", hid)
-    sub <- pa_obs[pa_obs$hru_id == hid & pa_obs$observed == 1, ]
-    if(nrow(sub) == 0 || !(col %in% names(pa_out))) next
-    win <- pa_out[index(pa_out) >= cal_start & index(pa_out) <= cal_end, col]
-    cat(sprintf("HRU %d | min=%.2e max=%.2e (obs flow n=%d)\n",
-                hid, min(win, na.rm=TRUE), max(win, na.rm=TRUE), nrow(sub)))
-  }
-  invisible(list(diag_out = diag_out, pa_out = pa_out))
-}
-
-cat("Running diagnostic with template defaults (include_sz = TRUE)...\n")
-Sys.time()
-diag <- run_diagnostic(mdl, obs_sim, obs_eval, pa_obs,
-                       outlet_id = OUTLET_ID, include_sz = TRUE)
-Sys.time()
-# After seeing diagnostics, set this to TRUE if q_sz is a major part of discharge
-INCLUDE_SZ_AT_OUTLET <- FALSE
-
-# =============================================================================
-# 6. OBJECTIVE FUNCTIONS
-# =============================================================================
-kge <- function(sim, obs){
-  both  <- merge(sim, obs, join = "inner")
-  s     <- as.numeric(both[, 1])
-  o     <- as.numeric(both[, 2])
-  valid <- is.finite(s) & is.finite(o) & abs(s) < 1e4
-  if(sum(valid) < 10) return(-Inf)
-  s <- s[valid]; o <- o[valid]
-  r <- cor(s, o); if(!is.finite(r)) return(-Inf)
-  a <- sd(s) / sd(o)
-  b <- mean(s) / mean(o)
-  1 - sqrt((r - 1)^2 + (a - 1)^2 + (b - 1)^2)
-}
-
-bias_ratio <- function(sim, obs){
-  both <- merge(sim, obs, join = "inner")
-  mean(as.numeric(both[,1]), na.rm=TRUE) / mean(as.numeric(both[,2]), na.rm=TRUE)
-}
-
-csi_presence_absence <- function(sim_output, pa_obs, threshold = FLOW_THRESHOLD){
-  TP <- FP <- FN <- TN <- 0L
-  for(hid in unique(pa_obs$hru_id)){
-    col_name <- paste0("q_sf_hru", hid)
-    if(!col_name %in% names(sim_output)) next
-    sub_obs <- pa_obs[pa_obs$hru_id == hid, ]
-    if(nrow(sub_obs) == 0) next
-    sub_xts <- xts(sub_obs$observed, order.by = as.POSIXct(sub_obs$datetime, tz = "UTC"))
-    both    <- merge(sim_output[, col_name], sub_xts, join = "inner")
-    if(nrow(both) == 0) next
-    sim_bin <- as.integer(as.numeric(both[, 1]) >= threshold)
-    obs_bin <- as.integer(as.numeric(both[, 2]))
-    valid   <- !is.na(sim_bin) & !is.na(obs_bin)
-    sim_bin <- sim_bin[valid]; obs_bin <- obs_bin[valid]
-    if(length(sim_bin) == 0) next
-    TP <- TP + sum(sim_bin == 1L & obs_bin == 1L)
-    FP <- FP + sum(sim_bin == 1L & obs_bin == 0L)
-    FN <- FN + sum(sim_bin == 0L & obs_bin == 1L)
-    TN <- TN + sum(sim_bin == 0L & obs_bin == 0L)
-  }
-  denom <- TP + FP + FN
-  if(denom == 0) return(NULL)
-  list(
-    CSI = TP / denom,
-    #CSI = if((TP+FP+FN+TN)>0) (TP+TN)/(TP+FP+FN+TN) else 0,
-    POD = if((TP+FN)>0) TP/(TP+FN) else 0,
-    FAR = if((TP+FP)>0) FP/(TP+FP) else 0,
-    F1  = if((2*TP+FP+FN)>0) 2*TP/(2*TP+FP+FN) else 0,
-    accuracy = if((TP+FP+FN+TN)>0) (TP+TN)/(TP+FP+FN+TN) else 0,
-    TP=TP, FP=FP, FN=FN, TN=TN
-  )
-}
-
-# =============================================================================
-# 7. GLUE INFRASTRUCTURE
-# =============================================================================
-W_KGE <- 0.5
-W_CSI <- 0.5
-CSI_THRESHOLD <- 0.0
-
-glue_likelihood <- function(kge_val, csi_val, kge_thresh){
-  if(!is.finite(kge_val) || kge_val < kge_thresh) return(0)
-  if(!is.finite(csi_val) || csi_val < CSI_THRESHOLD) return(0)
-  kge_scaled <- (kge_val - kge_thresh) / (1 - kge_thresh)
-  csi_scaled <- csi_val
-  L_kge <- if(W_KGE > 0) kge_scaled ^ W_KGE else 1
-  L_csi <- if(W_CSI > 0) csi_scaled ^ W_CSI else 1
-  L_kge * L_csi
-}
-
-# Vectorized parameter sampler
-generate_lhs <- function(n_samp, pb){
-  d <- randomLHS(n_samp, nrow(pb))
-  M <- matrix(NA, nrow=n_samp, ncol=nrow(pb))
-  colnames(M) <- pb$name
-  for(i in seq_len(nrow(pb))){
-    lo <- pb$lower[i]; up <- pb$upper[i]
-    if(pb$log[i]){
-      loglo <- log10(lo); logup <- log10(up)
-      M[,i] <- 10^(d[,i]*(logup - loglo) + loglo)
-    } else {
-      M[,i] <- d[,i]*(up - lo) + lo
-    }
-  }
-  M
-}
-
-# Generic GLUE evaluator
-glue_eval <- function(param_vec,
-                      include_sz = FALSE,
-                      use_pa     = TRUE,
-                      kge_thresh = 0.0){
-  
-  params <- setNames(param_vec, param_bounds$name)
-  
-  # Hard guards for multiple soil groups
-  if(any(params[c("t_d_1", "t_d_2", "t_d_3")] < 900)) return(list(L=0, kge=NA, csi=NA, bias=NA))
-  if(params["s_rzmax"] <= 0)  return(list(L=0, kge=NA, csi=NA, bias=NA))
-  
-  sim <- run_model(params, #mdl_template, 
-                   obs_sim,
-                   outlet_id  = OUTLET_ID,
-                   pa_hru_ids = sort(unique(pa_obs$hru_id)),
-                   include_sz = include_sz)
-  
-  if(is.null(sim)) return(list(L=0, kge=NA, csi=NA, bias=NA))
-  
-  # Outlet discharge (xts, full length incl. spinup; merge with obs_q auto-subsets)
-  sim_q <- if(include_sz && "q_out_sz" %in% names(sim)){
-    sim[,"q_out"] + sim[,"q_out_sz"]
-  } else {
-    sim[,"q_out"]
-  }
-  
-  if(any(!is.finite(sim_q))) return(list(L=0, kge=NA, csi=NA, bias=NA))
-  
-  kge_val   <- kge(sim_q, obs_q)
-  bias_val  <- bias_ratio(sim_q, obs_q)
-  pa_scores <- if(use_pa) csi_presence_absence(sim, pa_obs) else NULL
-  csi_val   <- if(!is.null(pa_scores) && is.finite(pa_scores$CSI)) pa_scores$CSI else 0
-  #accuracy <- if(!is.null(pa_scores) && is.finite(pa_scores$accuracy)) pa_scores$accuracy else 0
-  
-  # Inside glue_eval, replace the single L <- ... line with:
-  if(!use_pa){
-    # Screening: pure KGE ranking, ignore CSI
-    if(!is.finite(kge_val) || kge_val < kge_thresh){
-      L <- 0
-    } else {
-      L <- ((kge_val - kge_thresh) / (1 - kge_thresh)) ^ W_KGE
-    }
-  } else {
-    L <- glue_likelihood(kge_val, csi_val, kge_thresh)
-  }
-  list(L = L, kge = kge_val, csi = csi_val, bias = bias_val)
-}
-
-run_glue <- function(n_samples,
-                     param_bounds,
-                     #mdl_template,
-                     obs_sim,
-                     obs_q,
-                     pa_obs,
-                     outlet_id    = 0L,
-                     n_cores      = 1L,
-                     seed         = 42L,
-                     use_pa       = TRUE,
-                     kge_thresh   = 0.0,
-                     include_sz   = FALSE,
-                     sub_step     = 3600){
-  
-  set.seed(seed)
-  n_params <- nrow(param_bounds)
-  param_matrix <- generate_lhs(n_samples, param_bounds)
-  
-  cat(sprintf("Running %d GLUE samples (%s) on %d core(s)...\n",
-              n_samples,
-              if(use_pa) "KGE+CSI" else "KGE only",
-              n_cores))
-  
-  # Local wrapper so that parApply/exporting is clean
-  obj_wrap <- function(v){
-    glue_eval(v,
-              include_sz = include_sz,
-              use_pa     = use_pa,
-              kge_thresh = kge_thresh)
-  }
-  
-  if(n_cores > 1L){
-    cl <- makeCluster(n_cores)
-    on.exit(stopCluster(cl), add = TRUE)
-    clusterExport(cl,
-      c(#"mdl_template",
-        "obs_sim","obs_q","pa_obs","param_bounds",
-        "OUTLET_ID","FLOW_THRESHOLD","W_KGE","W_CSI","CSI_THRESHOLD",
-        "run_model","strip_obs","kge","bias_ratio","csi_presence_absence",
-        "glue_likelihood","glue_eval","generate_lhs", "hru_soil_map"),
-      envir = environment())
-    clusterEvalQ(cl, { library(dynatop); library(xts) })
-    score_list <- parApply(cl, param_matrix, 1, obj_wrap)
-  } else {
-    score_list <- apply(param_matrix, 1, obj_wrap)
-  }
-  
-  results <- data.frame(
-    param_matrix,
-    L    = sapply(score_list, `[[`, "L"),
-    kge  = sapply(score_list, `[[`, "kge"),
-    csi  = sapply(score_list, `[[`, "csi"),
-    bias = sapply(score_list, `[[`, "bias")
-  )
-  
-  n_behav <- sum(results$L > 0, na.rm = TRUE)
-  cat(sprintf("Behavioural: %d / %d (%.1f%%) | Best KGE: %.3f\n",
-              n_behav, n_samples, 100*n_behav/n_samples,
-              max(results$kge, na.rm=TRUE)))
-  
-  if(n_behav == 0)
-    cat("No behavioural runs — try lowering kge_thresh or check run_model.\n")
-  
-  results$L_norm <- if(sum(results$L, na.rm=TRUE) > 0){
-    results$L / sum(results$L, na.rm=TRUE)
-  } else NA_real_
-  
-  results[order(-results$L), ]
-}
-
-# =============================================================================
-# 8. UNCERTAINTY BOUNDS (unchanged logic, accepts include_sz via run_model)
-# =============================================================================
-glue_uncertainty_bounds <- function(glue_results, param_bounds,
-                                    #mdl_template, 
-                                    obs_sim, obs_q,
-                                    outlet_id = 0L,
-                                    quantiles = c(0.05, 0.95),
-                                    include_sz = FALSE){
-  
-  behav <- glue_results[glue_results$L > 0 & !is.na(glue_results$L), ]
-  if(nrow(behav) == 0) stop("No behavioural runs.")
-  cat(sprintf("Bounds from %d behavioural runs...\n", nrow(behav)))
-  
-  sim_list <- lapply(seq_len(nrow(behav)), function(i){
-    p <- setNames(as.numeric(behav[i, param_bounds$name]), param_bounds$name)
-    s <- run_model(p, mdl_template, obs_sim, outlet_id,
-                   include_sz = include_sz)
-    if(is.null(s)) return(NULL)
-    q <- if(include_sz && "q_out_sz" %in% names(s)) s[,"q_out"] + s[,"q_out_sz"] else s[,"q_out"]
-    as.numeric(q)
-  })
-  
-  good  <- !sapply(sim_list, is.null)
-  sims  <- sim_list[good]
-  L_w   <- behav$L_norm[good]
-  L_w   <- L_w / sum(L_w)
-  
-  sim_mat <- do.call(cbind, sims)
-  # align with obs_q (just in case spinup mismatched length)
-  nobs <- length(na.omit(as.numeric(obs_q)))
-  if(nrow(sim_mat) != nobs){
-    # attempt to trim to evaluation window index length
-    sim_mat <- sim_mat[(nrow(sim_mat)-nobs+1):nrow(sim_mat), , drop=FALSE]
-  }
-  
-  bounds <- data.frame(
-    datetime = index(obs_q),
-    q_obs    = as.numeric(obs_q),
-    q_best   = sim_mat[, which.max(L_w)],
-    q_mean   = apply(sim_mat, 1, weighted.mean, w = L_w)
-  )
-  for(q in quantiles){
-    col <- paste0("q_", sprintf("%02d", round(q*100)))
-    bounds[[col]] <- apply(sim_mat, 1, function(row){
-      ord <- order(row); cw <- cumsum(L_w[ord])
-      row[ord][which(cw >= q)[1]]
-    })
-  }
-  bounds
-}
-
-# Plotting functions (keep originals, just pass result)
-plot_glue_bounds <- function(bounds){
-  t_idx <- bounds$datetime
-  y_max <- max(c(bounds$q_obs, bounds$q_95), na.rm=TRUE)*1.1
-  plot(t_idx, bounds$q_obs, type="l", col="black", lwd=1.5,
-       ylim=c(0, y_max), main="GLUE bounds vs observed [m3/s]", xlab="", ylab="m3/s")
-  polygon(c(t_idx, rev(t_idx)), c(bounds$q_05, rev(bounds$q_95)),
-          col=adjustcolor("steelblue", alpha.f=0.3), border=NA)
-  lines(t_idx, bounds$q_best, col="firebrick", lwd=1.5)
-  lines(t_idx, bounds$q_mean, col="steelblue", lwd=1, lty=2)
-  legend("topright", legend=c("Obs","Best","Mean","5-95%"),
-         col=c("black","firebrick","steelblue",adjustcolor("steelblue",0.4)),
-         lwd=c(1.5,1.5,1,8), lty=c(1,1,2,1))
-}
-
-plot_glue_dotty <- function(glue_results, param_bounds){
-  behav    <- glue_results[glue_results$L > 0 & !is.na(glue_results$L), ]
-  nonbehav <- glue_results[is.na(glue_results$L) | glue_results$L == 0, ]
-  n_plots  <- nrow(param_bounds)
-  nr <- ceiling(sqrt(n_plots)); nc <- ceiling(n_plots/nr)
-  par(mfrow=c(nr,nc))
-  for(pn in param_bounds$name){
-    y_max <- if(nrow(behav)>0) max(behav$L, na.rm=TRUE) else 1
-    xlim  <- c(param_bounds$lower[param_bounds$name==pn],
-               param_bounds$upper[param_bounds$name==pn])
-    if(nrow(nonbehav)>0)
-      plot(nonbehav[[pn]], nonbehav$L, xlab=pn, ylab="Likelihood",
-           pch=16, cex=0.4, col="grey70", ylim=c(0.3,y_max), xlim=xlim)
-    else
-      plot(0,0, xlab=pn, ylab="Likelihood", ylim=c(0.3,y_max), xlim=xlim, type="n")
-    if(nrow(behav)>0)
-      points(behav[[pn]], behav$L, pch=16, cex=0.7, col="firebrick")
-    abline(h=0, lty=2, col="grey50")
-  }
-  par(mfrow=c(1,1))
-}
-
-# Helper: tighten bounds from behavioral percentile + margin
-tighten_bounds <- function(pb, runs, prob = c(0.02, 0.98), pad = 1.2){
-  pb2 <- pb
-  for(i in seq_len(nrow(pb))){
-    nm <- pb$name[i]
-    vals <- runs[[nm]]
-    if(length(vals) < 5) next
-    q <- quantile(vals, probs = prob, na.rm = TRUE)
-    if(pb$log[i]){
-      lo <- q[1] / pad
-      up <- q[2] * pad
-    } else {
-      w  <- (q[2] - q[1]) * (pad - 1)/2
-      lo <- q[1] - w
-      up <- q[2] + w
-    }
-    pb2$lower[i] <- max(pb2$lower[i], lo)
-    pb2$upper[i] <- min(pb2$upper[i], up)
-    if(pb2$log[i]) pb2$lower[i] <- max(pb2$lower[i], 1e-7)
-  }
-  pb2
-}
-
-# =============================================================================
-# 9. RUN — Two-stage GLUE
-# =============================================================================
-
-
-# -- Stage 1: Wide screen on discharge only -----------------------------------
-cat("\n============= STAGE 1: DISCHARGE SCREENING =============\n")
-Sys.time()
-screen_results <- run_glue(
-  n_samples    = 1,          # 3k cheap runs to find the sweet spot
-  param_bounds = param_bounds,
-  #mdl_template = mdl,
-  obs_sim      = obs_sim,
-  obs_q        = obs_q,
-  pa_obs       = pa_obs,
-  outlet_id    = OUTLET_ID,
-  n_cores      = 1L,
-  seed         = 1L,
-  use_pa       = FALSE,         # ignore PA for now
-  kge_thresh   = 0.0,          # permissive but not garbage
-  include_sz   = FALSE
-)
-# for(z in 1:48){
-# screen_results <- run_glue(
-#   n_samples    = 1000,          # 3k cheap runs to find the sweet spot
-#   param_bounds = param_bounds,
-#   mdl_template = mdl,
-#   obs_sim      = obs_sim,
-#   obs_q        = obs_q,
-#   pa_obs       = pa_obs,
-#   outlet_id    = OUTLET_ID,
-#   n_cores      = 7L,
-#   seed         = 236L+z,
-#   use_pa       = FALSE,         # ignore PA for now
-#   kge_thresh   = -0.4,          # permissive but not garbage
-#   include_sz   = FALSE
-# )
-# #Sys.time()
-# saveRDS(screen_results, 
-#         paste0("./glue_results_soils/glue_screen1000_seed",236+z,".rds"))
-# print(paste0("run ",z," out of 48"))
-#         
-# }
-
-## 5/10/26, did about 30,000 runs, no kge above 0
-## tighten bounds, and do again
-files <- list.files("./glue_results_soils")
-for(i in 1:length(files)){
-  file <- files[i]
-  
-  raw_glue <- readRDS(paste0("./glue_results_soils/",file))
-  screen_glue <- raw_glue[raw_glue$L > 0 & !is.na(raw_glue$L), ]
-  
-  if(i == 1) alldat <- screen_glue
-  if(i > 1) alldat <- rbind(alldat, screen_glue)
-}
-screen_behav <- alldat %>% 
-  filter(kge >= -0.4)
-screen_behav[1:10,]
-screen_behav %>% 
-  tibble() %>% 
-arrange(desc(kge))
-# Tighten to 5th–95th percentile of behavioral sets, with a little padding
-pb_focused <- tighten_bounds(param_bounds, screen_behav, prob = c(0.05, 0.95), pad = 1.2)
-
-
-screen_results <- run_glue(
-  n_samples    = 10,          # 3k cheap runs to find the sweet spot
-  param_bounds = best_params,
-  mdl_template = mdl,
-  obs_sim      = obs_sim,
-  obs_q        = obs_q,
-  pa_obs       = pa_obs,
-  outlet_id    = OUTLET_ID,
-  n_cores      = 6L,
-  seed         = 301L,
-  use_pa       = FALSE,         # ignore PA for now
-  kge_thresh   = 0.0,          # permissive but not garbage
-  include_sz   = FALSE
-)
-#Sys.time()
-saveRDS(screen_results, 
-        paste0("./glue_results_soils/glue_screen1000_seed300.rds"))
-
-cat("\nTop 10 Stage-2 behavioral runs:\n")
-best <- screen_results %>% 
-  tibble() %>% 
-arrange(desc(kge))
-
-best_params <- setNames(as.numeric(best[1, param_bounds$name]), param_bounds$name)
-best_sim <- run_model(best_params, mdl, obs_sim,
-                      outlet_id  = OUTLET_ID,
-                      pa_hru_ids = sort(unique(pa_obs$hru_id)),
-                      include_sz = FALSE)
-plot(best_sim$q_out)
-
-######## second round
-# Extract winner
-winner <- screen_results[which.max(screen_results$kge), ]
-winner_params <- setNames(as.numeric(winner[, param_bounds$name]), param_bounds$name)
-best_params
-# Focused bounds around the sweet spot (±1 order of magnitude for logs, ±2× for linear)
-param_bounds_focused <- data.frame(
-  name  = c("t_0","m","t_d","s_rzmax","c_sf","n_ch","v_ch","T_T","C_f","C_wh"),
-  lower = c(0.03,   0.001,  1800,   0.03,   0.05,  0.01,  0.3,  -1.0,  0.5,   0.05),
-  upper = c(5.0,    0.05,   86400,  0.3,    1.5,   0.1,   3.0,   2.0,  10.0,  0.6),
-  log   = c(TRUE,   FALSE,  TRUE,   FALSE,  TRUE,  FALSE, FALSE, FALSE, TRUE,  FALSE),
-  stringsAsFactors = FALSE
-)
-files <- list.files("./glue_results")
-for(i in 1:length(files)){
-  file <- files[i]
-  
-  raw_glue <- readRDS(paste0("./glue_results/",file))
-  screen_glue <- raw_glue[raw_glue$L > 0 & !is.na(raw_glue$L), ]
-  
-  if(i == 1) alldat <- screen_glue
-  if(i > 1) alldat <- rbind(alldat, screen_glue)
-}
-screen_behav <- alldat
-
-# Tighten to 5th–95th percentile of behavioral sets, with a little padding
-pb_focused <- tighten_bounds(param_bounds, screen_behav, prob = c(0.05, 0.95), pad = 1.2)
-cat("\nFocused bounds after Stage 1:\n")
-print(pb_focused)
-
-# -- Stage 2: Focused GLUE with PA --------------------------------------------
-cat("\n============= STAGE 2: FOCUSED GLUE (KGE + PA) =============\n")
-Sys.time()
-glue_results <- run_glue(
-  n_samples    = 300,          # denser sample in reduced space
-  param_bounds = pb_focused,
-  mdl_template = mdl,
-  obs_sim      = obs_sim,
-  obs_q        = obs_q,
-  pa_obs       = pa_obs,
-  outlet_id    = OUTLET_ID,
-  n_cores      = 7L,
-  seed         = 107L,
-  use_pa       = TRUE,
-  kge_thresh   = 0.0,           # must beat the mean predictor
-  include_sz   = FALSE
-)
-saveRDS(glue_results, "./glue_PA_acc_results/glue_screen3000_seed104_PA.rds")
-tk <- readRDS("./glue_PA_acc_results/glue_screen3000_seed104_PA.rds")
-View(tk)
-best <- glue_results %>% 
-  tibble() %>% 
-arrange(desc(kge))
-best
-index <- which(glue_results$kge == max(glue_results$kge, na.rm = TRUE))
-glue_results[which(glue_results$kge == max(glue_results$kge, na.rm = TRUE)),]
-#big_best <- best
-# =============================================================================
-# 10. EVALUATE BEST PARAMETER SET
-# =============================================================================
-cat("\nTop 10 Stage-2 behavioral runs:\n")
-print(head(glue_results[glue_results$L > 0 & !is.na(glue_results$L),
-                        c(param_bounds$name, "L", "kge", "csi", "bias")], 10))
-
-best_params <- setNames(as.numeric(glue_results[index, pb_focused$name]), pb_focused$name)
-best_sim <- run_model(best_params, mdl, obs_sim,
-                      outlet_id  = OUTLET_ID,
-                      pa_hru_ids = sort(unique(pa_obs$hru_id)),
-                      include_sz = FALSE)
-
-# Compose total discharge for plotting
-best_q <- best_sim[,"q_out"]
-
-
-cat("\nBest run evaluation:\n")
-cat("KGE :", kge(best_q, obs_q), "\n")
-cat("Bias:", bias_ratio(best_q, obs_q), "\n")
-
-pa_best <- csi_presence_absence(best_sim, pa_obs)
-if(!is.null(pa_best)){
-  cat(sprintf("CSI=%.3f POD=%.3f FAR=%.3f TP=%d FP=%d FN=%d TN=%d\n ACC=%.3f",
-              pa_best$CSI, pa_best$POD, pa_best$FAR,
-              pa_best$TP, pa_best$FP, pa_best$FN, pa_best$TN, pa_best$accuracy))
-}
-
-# -- Discharge plot --
-plot(merge(obs_q, best_q),
-     main = "Observed vs Simulated discharge [m3/s]",
-     legend.loc = "topright",
-     ylim = c(0, max(c(as.numeric(obs_q), as.numeric(best_q)), na.rm=TRUE)*1.1),
-     col = c("black", "firebrick"))
-plot(merge(best_q, obs_q),
-     main = "Observed vs Simulated discharge [m3/s]",
-     legend.loc = "topright",
-     ylim = c(0, max(c(as.numeric(obs_q), as.numeric(best_q)), na.rm=TRUE)*1.1),
-     col = c("firebrick", "black"))
-
-# -- Dotty plots for focused run --
-#par(mar=c(3,3,3,3))
-
-plot_glue_dotty(tk, pb_focused)
-
-# -- PA site plots --
-for(hid in sort(unique(pa_obs$hru_id))){
-  col_name <- paste0("q_sf_hru", hid)
-  if(!col_name %in% names(best_sim)) next
-  sim_q <- best_sim[, col_name]
-  sub   <- pa_obs[pa_obs$hru_id == hid, ]
-  
-  t_sim <- index(sim_q)
-  ylims <- c(0, max(c(as.numeric(sim_q), FLOW_THRESHOLD*3), na.rm=TRUE))
-  xlims <- c(min(pa_obs$datetime), max(all_23$datetime))
-  
-  plot(t_sim, as.numeric(sim_q), type="l",
-       main = paste("HRU", hid, "— simulated q_sf vs observations 2023"),
-       ylab = "m3/s", xlab = "", col = "steelblue", ylim = ylims
-       ,xlim = xlims
-       )
-  abline(h = FLOW_THRESHOLD, lty = 2, col = "grey40")
-  
-  flowing <- sub[sub$observed == 1, ]
-  dry     <- sub[sub$observed == 0, ]
-  
-  if(nrow(flowing) > 0){
-    t_f <- sort(unique(as.POSIXct(flowing$datetime, tz="UTC")))
-    rect(xleft = head(t_f,-1), xright = tail(t_f,-1),
-         ybottom = 0, ytop = par("usr")[4],
-         col = adjustcolor("green", 0.15), border = NA)
-  }
-  if(nrow(dry) > 0){
-    t_d <- sort(unique(as.POSIXct(dry$datetime, tz="UTC")))
-    rect(xleft = head(t_d,-1), xright = tail(t_d,-1),
-         ybottom = 0, ytop = par("usr")[4],
-         col = adjustcolor("red", 0.1), border = NA)
-  }
-  legend("topright",
-         legend = c("Simulated q_sf", "Flow threshold", "Obs: flowing", "Obs: dry"),
-         col = c("steelblue","grey40", adjustcolor("green",0.4), adjustcolor("red",0.3)),
-         lty = c(1,2,NA,NA), pch = c(NA,NA,15,15), cex=0.8)
-}
-
-## SUMMER 2024
-for(hid in sort(unique(pa_obs$hru_id))){
-  col_name <- paste0("q_sf_hru", hid)
-  if(!col_name %in% names(best_sim)) next
-  sim_q <- best_sim[, col_name]
-  sub   <- pa_obs[pa_obs$hru_id == hid, ]
-  
-  t_sim <- index(sim_q)
-  ylims <- c(0, max(c(as.numeric(sim_q), FLOW_THRESHOLD*3), na.rm=TRUE))
-  xlims <- c(min(all_24$datetime), max(all_24$datetime))
-  
-  plot(t_sim, as.numeric(sim_q), type="l",
-       main = paste("HRU", hid, "— simulated q_sf vs observations 2024"),
-       ylab = "m3/s", xlab = "", col = "steelblue", ylim = ylims
-       ,xlim = xlims
-       )
-  abline(h = FLOW_THRESHOLD, lty = 2, col = "grey40")
-  
-  flowing <- sub[sub$observed == 1, ]
-  dry     <- sub[sub$observed == 0, ]
-  
-  if(nrow(flowing) > 0){
-    t_f <- sort(unique(as.POSIXct(flowing$datetime, tz="UTC")))
-    rect(xleft = head(t_f,-1), xright = tail(t_f,-1),
-         ybottom = 0, ytop = par("usr")[4],
-         col = adjustcolor("green", 0.15), border = NA)
-  }
-  if(nrow(dry) > 0){
-    t_d <- sort(unique(as.POSIXct(dry$datetime, tz="UTC")))
-    rect(xleft = head(t_d,-1), xright = tail(t_d,-1),
-         ybottom = 0, ytop = par("usr")[4],
-         col = adjustcolor("red", 0.1), border = NA)
-  }
-  legend("topright",
-         legend = c("Simulated q_sf", "Flow threshold", "Obs: flowing", "Obs: dry"),
-         col = c("steelblue","grey40", adjustcolor("green",0.4), adjustcolor("red",0.3)),
-         lty = c(1,2,NA,NA), pch = c(NA,NA,15,15), cex=0.8)
-}
-
-
-
-
-# -- Uncertainty bounds --
-n_behav <- sum(glue_results$L > 0, na.rm=TRUE)
-#if(n_behav >= 10){
-  bounds <- glue_uncertainty_bounds(best[1:10,], pb_focused,
-                                    mdl, obs_sim, obs_q,
-                                    outlet_id = OUTLET_ID,
-                                    include_sz = FALSE)
-  plot_glue_bounds(bounds)
-
-```
-
-
-```{r}
+```{r good parameterization routine}
 # =============================================================================
 # dynatop Parameterisation — simplified and efficient
 # Calibrates against: NSE, KGE, CSI, Accuracy (presence/absence)
@@ -2335,7 +1456,7 @@ pa_obs <- read_csv("./7th_attempt/pa_obs.csv") %>%
   filter(mins == 0) %>% 
   select(!mins) %>% 
   mutate(datetime = as.POSIXct(datetime))
-FLOW_THRESHOLD <- 1e-4
+SZ_THRESHOLD <- 0.01
 OUTLET_ID      <- 0L
 
 strip_obs <- function(x){
@@ -2346,8 +1467,8 @@ build_out_rows <- function(pa_hru_ids, outlet_id = OUTLET_ID){
   rbind(
     data.frame(name="q_out", id=outlet_id, flux="q_sf",
                scale=1.0, stringsAsFactors=FALSE),
-    data.frame(name=paste0("q_sf_hru", pa_hru_ids),
-               id=pa_hru_ids, flux="q_sf",
+    data.frame(name=paste0("s_sz_hru", pa_hru_ids),
+               id=pa_hru_ids, flux="s_sz",
                scale=1.0, stringsAsFactors=FALSE)
   )
 }
@@ -2511,26 +1632,26 @@ kge_fun <- function(sim, obs){
   1 - sqrt((r-1)^2 + (sd(s)/sd(o)-1)^2 + (mean(s)/mean(o)-1)^2)
 }
 
-nse_fun <- function(sim, obs){
+lnse_fun <- function(sim, obs){
   b     <- merge(sim, obs, join = "inner")
   s     <- as.numeric(b[,1]); o <- as.numeric(b[,2])
-  valid <- is.finite(s) & is.finite(o) & abs(s) < 1e3
+  valid <- is.finite(s) & is.finite(o) & abs(s) < 1e3 & s > 0 & o > 0
   if(sum(valid) < 10) return(-Inf)
-  s <- s[valid]; o <- o[valid]
-  1 - sum((s-o)^2) / sum((o - mean(o))^2)
+  s <- log(s[valid]); o <- log(o[valid])
+  1 - sum((s - o)^2) / sum((o - mean(o))^2)
 }
 
-pa_metrics <- function(sim_out, pa_obs, threshold = FLOW_THRESHOLD){
+pa_metrics <- function(sim_out, pa_obs, sz_threshold = SZ_THRESHOLD){
   TP <- FP <- FN <- TN <- 0L
   for(hid in unique(pa_obs$hru_id)){
-    col <- paste0("q_sf_hru", hid)
+    col <- paste0("s_sz_hru", hid)
     if(!col %in% names(sim_out)) next
     sub <- pa_obs[pa_obs$hru_id == hid, ]
     if(nrow(sub) == 0) next
     sx  <- xts(sub$observed, order.by = as.POSIXct(sub$datetime, tz="UTC"))
     b   <- merge(sim_out[, col], sx, join = "inner")
     if(nrow(b) == 0) next
-    sb  <- as.integer(as.numeric(b[,1]) >= threshold)
+    sb <- as.integer(as.numeric(b[,1]) <= sz_threshold)  # <= not >=
     ob  <- as.integer(as.numeric(b[,2]))
     ok  <- !is.na(sb) & !is.na(ob)
     sb  <- sb[ok]; ob <- ob[ok]
@@ -2602,7 +1723,7 @@ evaluate_sample <- function(param_vec){
 
   sim_q  <- sim[,"q_out"]
   kge_v  <- kge_fun(sim_q, obs_q)
-  nse_v  <- nse_fun(sim_q, obs_q)
+  nse_v  <- lnse_fun(sim_q, obs_q)
 
   b      <- merge(sim_q, obs_q, join="inner")
   bias_v <- mean(as.numeric(b[,1]),na.rm=TRUE) /
@@ -2633,11 +1754,11 @@ run_glue <- function(n_samples = 500,
 
   exports <- c("param_bounds","N_PARAMS",
                "MDL_PATH","obs_sim","obs_q","pa_obs",
-               "OUTLET_ID","FLOW_THRESHOLD",
+               "OUTLET_ID","SZ_THRESHOLD",
                "W_KGE","W_NSE","W_CSI","W_ACC","KGE_THRESH",
                "run_model","apply_params_to_hru",
                "build_out_rows","strip_obs",
-               "kge_fun","nse_fun","pa_metrics","glue_L",
+               "kge_fun","lnse_fun","pa_metrics","glue_L",
                "evaluate_sample")
 
   if(n_cores > 1L){
@@ -2735,7 +1856,7 @@ cat(sprintf("Runtime: %.1fs\n", as.numeric(Sys.time()-t0, units="secs")))
 
 if(!is.null(test_sim)){
   cat("KGE:", round(kge_fun(test_sim[,"q_out"], obs_q), 3), "\n")
-  cat("NSE:", round(nse_fun(test_sim[,"q_out"], obs_q), 3), "\n")
+  cat("NSE:", round(lnse_fun(test_sim[,"q_out"], obs_q), 3), "\n")
   pa_t <- pa_metrics(test_sim, pa_obs)
   cat(sprintf("CSI=%.3f  Acc=%.3f  TP=%d FP=%d FN=%d TN=%d\n",
               pa_t$CSI, pa_t$accuracy, pa_t$TP, pa_t$FP, pa_t$FN, pa_t$TN))
@@ -2747,7 +1868,7 @@ if(!is.null(test_sim)){
 
 # ── Step 2: broad Stage 1 screen ──────────────────────────────────────────────
 Sys.time()
-g1 <- run_glue(n_samples = 2000, n_cores = 6L, seed = 42L,
+g1 <- run_glue(n_samples = 1000, n_cores = 4L, seed = 43L,
                pb = param_bounds, tag = "stage1")
 Sys.time()
 saveRDS(g1, file.path(OUT_DIR, "unfocused_2000_seed42.rds"))
@@ -2798,13 +1919,13 @@ g2 <- run_glue(n_samples = 3000, n_cores = 7L, seed = 99L,
                pb = pb2, tag = "stage2")
 saveRDS(g1, file.path(OUT_DIR, "stage2_3000_seed99.rds"))
 
-for(z in 1:15){
-g1 <- run_glue(n_samples = 1000, n_cores = 7L, seed = 90L+z,
+for(z in 1:50){
+g1 <- run_glue(n_samples = 1000, n_cores = 7L, seed = 333L+z,
                pb = pb2, tag = "stage2")
 #Sys.time()
 saveRDS(g1,
-        paste0("./7th_attempt/glue_results_focused/glue_screen1000_seed",90+z,".rds"))
-print(paste0("run ",z," out of 15"))
+        paste0("./7th_attempt/glue_results_focused/glue_screen1000_seed",333+z,".rds"))
+print(paste0("run ",z," out of 50"))
 
 }
 
@@ -2838,20 +1959,703 @@ cat(sprintf("L=%.4f  KGE=%.3f  NSE=%.3f  CSI=%.3f  Acc=%.3f  Bias=%.3f\n",
 best_sim <- run_model(best_p)
 if(!is.null(best_sim)){
   plot(merge(obs_q, best_sim[,"q_out"]),
-       main="Best run: observed vs simulated [m3/s]",
+       main="Best NSE",
        col=c("black","firebrick"), legend.loc="topright")
 }
 # Best kge
-best_kge <- good_ones[order(-good_ones$kge), ][1,]
+best_kge <- good_ones[order(-good_ones$nse), ][1,]
 best_p <- setNames(as.numeric(best_kge[1, param_bounds$name]), param_bounds$name)
 
 best_sim <- run_model(best_p)
 #if(!is.null(best_sim)){
   plot(merge(best_sim[,"q_out"], obs_q),
-       main="Best run: observed vs simulated [m3/s]",
+       main="Best KGE",
        col=c("firebrick", "black"), legend.loc="topright")
 # ── Step 5: dotty plots ───────────────────────────────────────────────────────
 plot_dotty(all_res, param_bounds, metric="L")
+```
+
+```{r}
+# =============================================================================
+# dynatop Parameterisation — v2
+# Objectives: KGE, log-NSE, CSI and Accuracy via s_sz <= SZ_THRESHOLD
+# Soil-group-specific: t_0, m, t_d  (h$class$soil = 1 / 2 / 3)
+# Shared: s_rzmax, c_sf, T_T, C_f
+# Model reloaded from disk every run — no state corruption possible
+# =============================================================================
+
+library(dynatop)
+library(xts)
+library(lhs)
+library(parallel)
+library(dplyr)
+library(readr)
+library(lubridate)
+
+# =============================================================================
+# 1.  PATHS
+# =============================================================================
+MDL_PATH  <- file.path(".", "7th_attempt", "dynaGISgoodChannel7", "model_ready.rds")
+OBS_PATH  <- file.path(".", "7th_attempt", "obs.rds")
+PA_PATH   <- file.path(".", "7th_attempt", "pa_obs.csv")
+OUT_DIR1  <- file.path(".", "7th_attempt", "glue_results2")           # Stage 1
+OUT_DIR2  <- file.path(".", "7th_attempt", "glue_results_focused2")   # Stage 2
+dir.create(OUT_DIR1, showWarnings = FALSE)
+dir.create(OUT_DIR2, showWarnings = FALSE)
+
+# =============================================================================
+# 2.  DATA
+# =============================================================================
+obs_full <- readRDS(OBS_PATH)
+
+cal_start <- as.POSIXct("2021-01-01", tz = "UTC")
+cal_end   <- as.POSIXct("2024-11-26", tz = "UTC")
+spin_days <- 180L
+sim_start <- cal_start - spin_days * 86400
+
+obs_sim <- obs_full[index(obs_full) >= sim_start & index(obs_full) <= cal_end, ]
+obs_q   <- obs_full[index(obs_full) >= cal_start & index(obs_full) <= cal_end,
+                    "Discharge_m3_s"]
+
+# Presence/absence — filter to top-of-hour to match hourly model output
+pa_obs <- read_csv(PA_PATH, show_col_types = FALSE) %>%
+  mutate(datetime = as.POSIXct(datetime, tz = "UTC")) %>%
+  filter(minute(datetime) == 0) %>%
+  filter(datetime >= cal_start, datetime <= cal_end,
+         !is.na(hru_id), !is.na(observed))
+
+cat("PA sites:", sort(unique(pa_obs$hru_id)), "\n")
+cat("PA obs:", nrow(pa_obs),
+    "| flowing:", sum(pa_obs$observed == 1),
+    "| dry:",     sum(pa_obs$observed == 0), "\n")
+
+# Threshold: s_sz (saturated zone deficit, m) <= this value → channel is flowing
+# 0.01 m = 1 cm deficit — effectively saturated. Adjust after checking s_sz range.
+SZ_THRESHOLD <<- 0.01
+OUTLET_ID    <<- 0L
+
+# =============================================================================
+# 3.  HELPERS
+# =============================================================================
+strip_obs <- function(x){
+  x[, !names(x) %in% c("Discharge_m3_s", "Discharge_ls", "Discharge")]
+}
+
+build_out_rows <- function(pa_hru_ids, outlet_id = OUTLET_ID){
+  rbind(
+    data.frame(name  = "q_out",
+               id    = outlet_id,
+               flux  = "q_sf",
+               scale = 1.0,
+               stringsAsFactors = FALSE),
+    data.frame(name  = paste0("s_sz_hru", pa_hru_ids),
+               id    = pa_hru_ids,
+               flux  = "s_sz",   # saturated zone deficit — not q_sf
+               scale = 1.0,
+               stringsAsFactors = FALSE)
+  )
+}
+
+# =============================================================================
+# 4.  PARAMETER BOUNDS
+# =============================================================================
+# Soil group meanings (h$class$soil):
+#   1 = organic-rich near-stream  — high T0, moderate m, fast t_d
+#   2 = deep hillslope mineral    — moderate T0, LOW m,  slow t_d
+#   3 = shallow rocky             — moderate-high T0, HIGH m, fast t_d
+
+param_bounds <- data.frame(
+  name  = c("t_0_1","t_0_2","t_0_3",
+            "m_1",  "m_2",  "m_3",
+            "t_d_1","t_d_2","t_d_3",
+            "s_rzmax","c_sf","T_T","C_f"),
+  lower = c(0.10,  0.01,  0.05,
+            0.010, 0.001, 0.020,
+            3600,  86400, 3600,
+            0.03,  0.01, -2.0,  0.1),
+  upper = c(5.00,  0.50,  2.00,
+            0.040, 0.015, 0.060,
+            28800, 259200, 14400,
+            0.40,  0.50,  2.0,   5.0),
+  log   = c(TRUE,  TRUE,  TRUE,
+            FALSE, FALSE, FALSE,
+            TRUE,  TRUE,  TRUE,
+            FALSE, TRUE,  FALSE, TRUE),
+  stringsAsFactors = FALSE
+)
+N_PARAMS <<- nrow(param_bounds)
+
+# =============================================================================
+# 5.  PARAMETER APPLICATION
+# =============================================================================
+apply_params_to_hru <- function(h, p){
+  is_channel <- isTRUE(!is.na(h$class$endNode))
+
+  if(!is_channel){
+    grp <- as.integer(h$class$soil)
+    if(is.null(grp) || is.na(grp)) grp <- 1L
+
+    h$sz$parameters["t_0"] <- p[paste0("t_0_", grp)]
+    h$sz$parameters["m"]   <- p[paste0("m_",   grp)]
+    h$uz$parameters["t_d"] <- p[paste0("t_d_", grp)]
+    h$rz$parameters["s_rzmax"] <- p["s_rzmax"]
+    if(isTRUE(h$sf$type == "cnst"))
+      h$sf$parameters["c_sf"] <- p["c_sf"]
+
+  } else {
+    h$sz$parameters["t_0"]     <- 0.001
+    h$sz$parameters["m"]       <- 0.001
+    h$rz$parameters["s_rzmax"] <- 0.001
+    if(isTRUE(h$sf$type == "cnst")){
+      h$sf$parameters["c_sf"]  <- p["c_sf"]
+      h$sf$parameters["t_raf"] <- 999.9
+    }
+  }
+
+  if(!is.null(h$snow) && !is.null(h$snow$parameters)){
+    h$snow$parameters["T_T"] <- p["T_T"]
+    h$snow$parameters["C_f"] <- p["C_f"]
+  }
+  return(h)
+}
+
+verify_params <- function(p){
+  mdl_v <- readRDS(MDL_PATH)
+  for(grp in 1:3){
+    idx <- which(sapply(mdl_v$hru, function(h){
+      isTRUE(as.integer(h$class$soil) == grp) &&
+        isTRUE(is.na(h$class$endNode))
+    }))[1]
+    if(is.na(idx)){ cat("Soil group", grp, ": no HRU found\n"); next }
+    hm <- apply_params_to_hru(mdl_v$hru[[idx]], p)
+    cat(sprintf("Group %d (HRU %d): t_0=%.4f  m=%.5f  t_d=%.0f\n",
+                grp, mdl_v$hru[[idx]]$id,
+                hm$sz$parameters["t_0"],
+                hm$sz$parameters["m"],
+                hm$uz$parameters["t_d"]))
+  }
+}
+
+# =============================================================================
+# 6.  MODEL RUNNER
+# =============================================================================
+run_model <- function(p,
+                      mdl_path   = MDL_PATH,
+                      obs        = obs_sim,
+                      outlet_id  = OUTLET_ID,
+                      pa_hru_ids = sort(unique(pa_obs$hru_id)),
+                      sub_step   = 3600L){
+
+  mdl <- readRDS(mdl_path)
+
+  # Zero uninitialised snow states
+  for(ii in seq_along(mdl$hru)){
+    sv <- mdl$hru[[ii]]$states
+    if("s_snow"   %in% names(sv)) mdl$hru[[ii]]$states["s_snow"]   <- 0.0
+    if("s_liquid" %in% names(sv)) mdl$hru[[ii]]$states["s_liquid"] <- 0.0
+  }
+
+  hru <- lapply(mdl$hru, apply_params_to_hru, p = p)
+
+  total_area <- sum(sapply(hru, function(h) h$properties["area"]))
+  q_init     <- as.numeric(na.omit(obs$Discharge_m3_s))[1]
+  if(!is.finite(q_init) || q_init <= 0) q_init <- 1e-5
+
+  for(ii in seq_along(hru)){
+    t0_v   <- hru[[ii]]$sz$parameters["t_0"]
+    m_v    <- hru[[ii]]$sz$parameters["m"]
+    grad_v <- as.numeric(hru[[ii]]$properties["gradient"])
+    if(!is.finite(grad_v) || grad_v <= 0) grad_v <- 1e-4
+    max_q  <- t0_v * m_v * grad_v
+
+    hru[[ii]]$initialisation["s_rz_0"]    <- 0.75
+    hru[[ii]]$initialisation["r_uz_sz_0"] <- min(q_init / total_area,
+                                                   max_q * 0.5)
+  }
+
+  out_rows <- build_out_rows(pa_hru_ids, outlet_id)
+  obs_in   <- strip_obs(obs)
+
+  result <- tryCatch({
+    cm <- dynatop$new(hru, map = mdl$map)
+    cm$add_data(obs_in)
+    cm$initialise()
+    cm$sim(out_rows, sub_step = sub_step)$get_output()
+  }, error = function(e) NULL)
+
+  return(result)
+}
+
+# =============================================================================
+# 7.  OBJECTIVE FUNCTIONS
+# =============================================================================
+kge_fun <- function(sim, obs){
+  b     <- merge(sim, obs, join = "inner")
+  s     <- as.numeric(b[,1]); o <- as.numeric(b[,2])
+  valid <- is.finite(s) & is.finite(o) & abs(s) < 1e3
+  if(sum(valid) < 10) return(-Inf)
+  s <- s[valid]; o <- o[valid]
+  r <- cor(s, o); if(!is.finite(r)) return(-Inf)
+  1 - sqrt((r-1)^2 + (sd(s)/sd(o)-1)^2 + (mean(s)/mean(o)-1)^2)
+}
+
+# Log-NSE: weights low flows more heavily than standard NSE.
+# Only uses timesteps where both sim and obs are strictly positive.
+lnse_fun <- function(sim, obs){
+  b     <- merge(sim, obs, join = "inner")
+  s     <- as.numeric(b[,1]); o <- as.numeric(b[,2])
+  valid <- is.finite(s) & is.finite(o) & s > 0 & o > 0 & abs(s) < 1e3
+  if(sum(valid) < 10) return(-Inf)
+  s <- log(s[valid]); o <- log(o[valid])
+  1 - sum((s - o)^2) / sum((o - mean(o))^2)
+}
+
+# Presence/absence via s_sz: flowing when saturated zone deficit <= SZ_THRESHOLD
+pa_metrics <- function(sim_out, pa_obs, sz_threshold = SZ_THRESHOLD){
+  TP <- FP <- FN <- TN <- 0L
+  for(hid in unique(pa_obs$hru_id)){
+    col <- paste0("s_sz_hru", hid)
+    if(!col %in% names(sim_out)) next
+    sub <- pa_obs[pa_obs$hru_id == hid, ]
+    if(nrow(sub) == 0) next
+    sx  <- xts(sub$observed,
+               order.by = as.POSIXct(sub$datetime, tz = "UTC"))
+    b   <- merge(sim_out[, col], sx, join = "inner")
+    if(nrow(b) == 0) next
+    sb  <- as.integer(as.numeric(b[,1]) <= sz_threshold)  # low deficit = wet
+    ob  <- as.integer(as.numeric(b[,2]))
+    ok  <- !is.na(sb) & !is.na(ob)
+    sb  <- sb[ok]; ob <- ob[ok]
+    TP  <- TP + sum(sb==1L & ob==1L)
+    FP  <- FP + sum(sb==1L & ob==0L)
+    FN  <- FN + sum(sb==0L & ob==1L)
+    TN  <- TN + sum(sb==0L & ob==0L)
+  }
+  n <- TP + FP + FN + TN
+  list(CSI      = if((TP+FP+FN)>0) TP/(TP+FP+FN) else NA_real_,
+       accuracy = if(n>0) (TP+TN)/n              else NA_real_,
+       TP=TP, FP=FP, FN=FN, TN=TN)
+}
+
+# =============================================================================
+# 8.  LIKELIHOOD
+# =============================================================================
+W_KGE      <<- 0.30
+W_LNSE     <<- 0.10
+W_CSI      <<- 0.30
+W_ACC      <<- 0.30
+KGE_THRESH <<- -0.5   # permissive start — raise once behavioural sets appear
+
+# Both KGE and log-NSE are rescaled from [KGE_THRESH, 1] → [0, 1]
+# before exponentiation, so they contribute symmetrically to the likelihood.
+glue_L <- function(kge_v, lnse_v, csi_v, acc_v, thresh = KGE_THRESH){
+  if(!is.finite(kge_v)  || kge_v  < thresh) return(0)
+  if(!is.finite(lnse_v) || lnse_v < thresh) return(0)
+
+  kge_sc  <- (kge_v  - thresh) / (1 - thresh)
+  lnse_sc <- (lnse_v - thresh) / (1 - thresh)
+  # Both already clamped by the threshold check above, but clamp to [0,1] for safety
+  kge_sc  <- min(1, max(0, kge_sc))
+  lnse_sc <- min(1, max(0, lnse_sc))
+
+  cs <- if(is.finite(csi_v)) min(1, max(0, csi_v)) else 0
+  ac <- if(is.finite(acc_v)) min(1, max(0, acc_v)) else 0
+
+  (kge_sc^W_KGE) * (lnse_sc^W_LNSE) * (cs^W_CSI) * (ac^W_ACC)
+}
+
+# =============================================================================
+# 9.  LHS SAMPLER
+# =============================================================================
+generate_lhs <- function(n, pb){
+  d <- randomLHS(n, nrow(pb))
+  M <- matrix(NA_real_, n, nrow(pb)); colnames(M) <- pb$name
+  for(i in seq_len(nrow(pb))){
+    lo <- pb$lower[i]; up <- pb$upper[i]
+    if(isTRUE(pb$log[i])){
+      M[,i] <- 10^(d[,i] * (log10(up) - log10(lo)) + log10(lo))
+    } else {
+      M[,i] <- d[,i] * (up - lo) + lo
+    }
+  }
+  M
+}
+
+# =============================================================================
+# 10.  SINGLE-SAMPLE EVALUATOR
+# =============================================================================
+evaluate_sample <- function(param_vec){
+  p <- setNames(param_vec, param_bounds$name)
+
+  # Hard parameter guards
+  if(any(p[c("t_d_1","t_d_2","t_d_3")] < 3600))
+    return(list(L=0, kge=NA, lnse=NA, csi=NA, accuracy=NA, bias=NA))
+  if(p["s_rzmax"] <= 0 || p["c_sf"] <= 0)
+    return(list(L=0, kge=NA, lnse=NA, csi=NA, accuracy=NA, bias=NA))
+
+  sim <- run_model(p)
+  if(is.null(sim))
+    return(list(L=0, kge=NA, lnse=NA, csi=NA, accuracy=NA, bias=NA))
+
+  # Targeted blow-up guard for discharge only (s_sz can legitimately be large)
+  q_vals <- as.numeric(sim[, "q_out"])
+  if(any(!is.finite(q_vals)) || any(abs(q_vals) > 1e3))
+    return(list(L=0, kge=NA, lnse=NA, csi=NA, accuracy=NA, bias=NA))
+
+  # Sanity check on s_sz columns: must be finite, non-negative, < 1e4 m
+  sz_cols <- grep("^s_sz_hru", names(sim), value = TRUE)
+  if(length(sz_cols) > 0){
+    sz_vals <- as.numeric(as.matrix(coredata(sim[, sz_cols])))
+    if(any(!is.finite(sz_vals)) || any(sz_vals < 0) || any(sz_vals > 1e4))
+      return(list(L=0, kge=NA, lnse=NA, csi=NA, accuracy=NA, bias=NA))
+  }
+
+  # Discharge metrics
+  sim_q  <- sim[, "q_out"]
+  kge_v  <- kge_fun(sim_q, obs_q)
+  lnse_v <- lnse_fun(sim_q, obs_q)
+
+  b      <- merge(sim_q, obs_q, join = "inner")
+  bias_v <- mean(as.numeric(b[,1]), na.rm=TRUE) /
+            mean(as.numeric(b[,2]), na.rm=TRUE)
+  if(!is.finite(bias_v) || bias_v > 100 || bias_v < 0.001)
+    return(list(L=0, kge=NA, lnse=NA, csi=NA, accuracy=NA, bias=bias_v))
+
+  # Presence/absence metrics via s_sz
+  pa    <- pa_metrics(sim, pa_obs)
+  csi_v <- if(!is.null(pa) && is.finite(pa$CSI))      pa$CSI      else 0
+  acc_v <- if(!is.null(pa) && is.finite(pa$accuracy)) pa$accuracy else 0
+
+  L <- glue_L(kge_v, lnse_v, csi_v, acc_v)
+
+  list(L=L, kge=kge_v, lnse=lnse_v, csi=csi_v, accuracy=acc_v, bias=bias_v)
+}
+
+# =============================================================================
+# 11.  GLUE RUNNER  (single batch)
+# =============================================================================
+run_glue_batch <- function(n_samples = 1000,
+                            n_cores   = 1L,
+                            seed      = 42L,
+                            pb        = param_bounds){
+  set.seed(seed)
+  pm <- generate_lhs(n_samples, pb)
+
+  exports <- c("param_bounds","N_PARAMS",
+               "MDL_PATH","obs_sim","obs_q","pa_obs",
+               "OUTLET_ID","SZ_THRESHOLD",
+               "W_KGE","W_LNSE","W_CSI","W_ACC","KGE_THRESH",
+               "run_model","apply_params_to_hru",
+               "build_out_rows","strip_obs",
+               "kge_fun","lnse_fun","pa_metrics","glue_L",
+               "evaluate_sample","generate_lhs")
+
+  if(n_cores > 1L){
+    cl <- makeCluster(n_cores)
+    on.exit(stopCluster(cl), add = TRUE)
+    clusterExport(cl, exports, envir = .GlobalEnv)
+    clusterEvalQ(cl, { library(dynatop); library(xts) })
+    sc <- parApply(cl, pm, 1, evaluate_sample)
+  } else {
+    sc <- apply(pm, 1, evaluate_sample)
+  }
+
+  data.frame(
+    pm,
+    L        = sapply(sc, `[[`, "L"),
+    kge      = sapply(sc, `[[`, "kge"),
+    lnse     = sapply(sc, `[[`, "lnse"),
+    csi      = sapply(sc, `[[`, "csi"),
+    accuracy = sapply(sc, `[[`, "accuracy"),
+    bias     = sapply(sc, `[[`, "bias")
+  )
+}
+
+# =============================================================================
+# 12.  TIGHTEN BOUNDS
+# =============================================================================
+tighten_bounds <- function(pb, behav, prob = c(0.05, 0.95), pad = 1.2){
+  pb2 <- pb
+  for(i in seq_len(nrow(pb))){
+    nm   <- pb$name[i]
+    vals <- behav[[nm]]
+    if(length(vals) < 5) next
+    q  <- quantile(vals, probs = prob, na.rm = TRUE)
+    if(isTRUE(pb$log[i])){
+      lo <- max(q[1] / pad, 1e-7); up <- q[2] * pad
+    } else {
+      w  <- (q[2] - q[1]) * (pad - 1) / 2
+      lo <- q[1] - w;              up <- q[2] + w
+    }
+    pb2$lower[i] <- max(pb$lower[i], lo)
+    pb2$upper[i] <- min(pb$upper[i], up)
+  }
+  pb2
+}
+
+# =============================================================================
+# 13.  LOAD ALL SAVED RESULTS FROM A DIRECTORY
+# =============================================================================
+load_all_results <- function(dir, min_kge = -Inf, min_L = 0){
+  files <- list.files(dir, pattern = "\\.rds$", full.names = TRUE)
+  if(length(files) == 0){ cat("No files found in", dir, "\n"); return(NULL) }
+  do.call(rbind, lapply(files, function(f){
+    tryCatch({
+      d <- readRDS(f)
+      d[!is.na(d$kge) & d$kge >= min_kge & d$L >= min_L, ]
+    }, error = function(e){
+      cat("Could not load:", f, "\n"); NULL
+    })
+  }))
+}
+
+# =============================================================================
+# 14.  DOTTY PLOTS
+# =============================================================================
+plot_dotty <- function(results, pb, metric = "L"){
+  behav <- results[results$L > 0 & !is.na(results$L), ]
+  nr    <- ceiling(sqrt(nrow(pb))); nc <- ceiling(nrow(pb) / nr)
+  par(mfrow = c(nr, nc))
+  for(nm in pb$name){
+    ymax <- if(nrow(behav) > 0) max(behav[[metric]], na.rm=TRUE) else 1
+    xlim <- c(pb$lower[pb$name == nm], pb$upper[pb$name == nm])
+    plot(results[[nm]], results[[metric]],
+         xlab=nm, ylab=metric, pch=16, cex=0.4,
+         col="grey70", ylim=c(0, ymax), xlim=xlim, main=nm)
+    if(nrow(behav) > 0)
+      points(behav[[nm]], behav[[metric]], pch=16, cex=0.7, col="firebrick")
+    abline(h = 0, lty = 2, col = "grey50")
+  }
+  par(mfrow = c(1, 1))
+}
+
+# =============================================================================
+# 15.  EXECUTE
+# =============================================================================
+
+# ── Verify parameters change correctly ────────────────────────────────────────
+cat("=== Parameter verification ===\n")
+p_lo <- setNames(param_bounds$lower, param_bounds$name)
+p_hi <- setNames(param_bounds$upper, param_bounds$name)
+p_lo[c("t_d_1","t_d_3")] <- 7200; p_lo["t_d_2"] <- 90000
+cat("Low params:\n");  verify_params(p_lo)
+cat("High params:\n"); verify_params(p_hi)
+
+# ── Single test run ───────────────────────────────────────────────────────────
+cat("\n=== Test run ===\n")
+p_mid <- setNames(param_bounds$lower, param_bounds$name)
+p_mid[param_bounds$log]  <- sqrt(param_bounds$lower[param_bounds$log] *
+                                   param_bounds$upper[param_bounds$log])
+p_mid[!param_bounds$log] <- (param_bounds$lower[!param_bounds$log] +
+                                param_bounds$upper[!param_bounds$log]) / 2
+
+t0       <- Sys.time()
+test_sim <- run_model(p_mid)
+cat(sprintf("Runtime: %.1fs\n", as.numeric(Sys.time()-t0, units="secs")))
+
+if(is.null(test_sim)) stop("Test run returned NULL — fix run_model before proceeding")
+
+cat("KGE:", round(kge_fun(test_sim[,"q_out"], obs_q), 3), "\n")
+cat("log-NSE:", round(lnse_fun(test_sim[,"q_out"], obs_q), 3), "\n")
+pa_t <- pa_metrics(test_sim, pa_obs)
+cat(sprintf("CSI=%.3f  Acc=%.3f  TP=%d FP=%d FN=%d TN=%d\n",
+            pa_t$CSI, pa_t$accuracy, pa_t$TP, pa_t$FP, pa_t$FN, pa_t$TN))
+
+# Check s_sz range at PA sites to confirm SZ_THRESHOLD is sensible
+sz_cols <- grep("^s_sz_hru", names(test_sim), value = TRUE)
+cat("\ns_sz ranges at PA sites:\n")
+for(col in sz_cols){
+  vals <- as.numeric(test_sim[, col])
+  n_flow <- sum(vals <= SZ_THRESHOLD, na.rm=TRUE)
+  cat(sprintf("  %s: min=%.4f  max=%.4f  flowing timesteps: %d/%d\n",
+              col, min(vals,na.rm=TRUE), max(vals,na.rm=TRUE),
+              n_flow, length(vals)))
+}
+
+plot(merge(obs_q, test_sim[,"q_out"]),
+     main = "Test run — observed vs simulated",
+     col  = c("black","firebrick"), legend.loc = "topright")
+
+# =============================================================================
+# STAGE 1 — Broad screen: 1000 batches × 1000 samples each
+# =============================================================================
+cat("\n=== Stage 1: broad screen ===\n")
+
+N_STAGE1_BATCHES <- 50    # change to 1000 for full run
+N_PER_BATCH      <- 1000
+N_CORES          <- 7L
+BASE_SEED        <- 60L
+
+for(z in seq_len(N_STAGE1_BATCHES)){
+  seed_z    <- BASE_SEED + z
+  out_file  <- file.path(OUT_DIR1,
+                          sprintf("glue_stage1_seed%d.rds", seed_z))
+
+  # Skip if already completed (allows resuming interrupted runs)
+  if(file.exists(out_file)){
+    cat(sprintf("[Stage 1] Batch %d/%d already done — skipping\n",
+                z, N_STAGE1_BATCHES))
+    next
+  }
+
+  # tryCatch ensures a failed batch does not kill the loop
+  tryCatch({
+    cat(sprintf("[Stage 1] Batch %d/%d (seed %d)...\n",
+                z, N_STAGE1_BATCHES, seed_z))
+    t_start <- Sys.time()
+
+    res <- run_glue_batch(n_samples = N_PER_BATCH,
+                           n_cores   = N_CORES,
+                           seed      = seed_z,
+                           pb        = param_bounds)
+
+    saveRDS(res, out_file)
+
+    nb <- sum(res$L > 0, na.rm=TRUE)
+    cat(sprintf("  Done in %.1fs — behavioural: %d/%d — best KGE=%.3f\n",
+                as.numeric(Sys.time()-t_start, units="secs"),
+                nb, N_PER_BATCH, max(res$kge, na.rm=TRUE)))
+
+  }, error = function(e){
+    cat(sprintf("  ERROR in batch %d: %s — continuing\n", z, e$message))
+  })
+}
+
+# ── Collate Stage 1 results ───────────────────────────────────────────────────
+cat("\nLoading Stage 1 results...\n")
+g1 <- load_all_results(OUT_DIR1, min_kge = -0.4)
+
+if(is.null(g1) || nrow(g1) == 0){
+  stop("No Stage 1 results with KGE >= -0.4. Lower the threshold or check run_model.")
+}
+
+cat("Stage 1 total usable runs:", nrow(g1), "\n")
+cat("KGE quantiles:\n")
+print(quantile(g1$kge, c(0,.1,.25,.5,.75,.9,1), na.rm=TRUE))
+cat("log-NSE quantiles:\n")
+print(quantile(g1$lnse, c(0,.1,.25,.5,.75,.9,1), na.rm=TRUE))
+
+# =============================================================================
+# STAGE 2 — Focused search: tighten bounds, run another 1000 batches
+# =============================================================================
+cat("\n=== Stage 2: focused search ===\n")
+
+behav1 <- g1[g1$L > 0 & !is.na(g1$L), ]
+focus  <- if(nrow(behav1) >= 10) behav1 else g1[order(-g1$kge), ][1:max(10, nrow(g1)%/%10), ]
+pb2    <- tighten_bounds(param_bounds, focus, prob = c(0.05, 0.95), pad = 1.3)
+
+cat("Focused bounds:\n")
+print(pb2[, c("name","lower","upper")])
+
+N_STAGE2_BATCHES <- 10    # change to 1000 for full run
+BASE_SEED2       <- 333L
+
+for(z in seq_len(N_STAGE2_BATCHES)){
+  seed_z   <- BASE_SEED2 + z
+  out_file <- file.path(OUT_DIR2,
+                         sprintf("glue_stage2_seed%d.rds", seed_z))
+
+  if(file.exists(out_file)){
+    cat(sprintf("[Stage 2] Batch %d/%d already done — skipping\n",
+                z, N_STAGE2_BATCHES))
+    next
+  }
+
+  tryCatch({
+    cat(sprintf("[Stage 2] Batch %d/%d (seed %d)...\n",
+                z, N_STAGE2_BATCHES, seed_z))
+    t_start <- Sys.time()
+
+    res <- run_glue_batch(n_samples = N_PER_BATCH,
+                           n_cores   = N_CORES,
+                           seed      = seed_z,
+                           pb        = pb2)
+
+    saveRDS(res, out_file)
+
+    nb <- sum(res$L > 0, na.rm=TRUE)
+    cat(sprintf("  Done in %.1fs — behavioural: %d/%d — best KGE=%.3f\n",
+                as.numeric(Sys.time()-t_start, units="secs"),
+                nb, N_PER_BATCH, max(res$kge, na.rm=TRUE)))
+
+  }, error = function(e){
+    cat(sprintf("  ERROR in batch %d: %s — continuing\n", z, e$message))
+  })
+}
+
+# =============================================================================
+# 16.  FINAL EVALUATION
+# =============================================================================
+cat("\n=== Final evaluation ===\n")
+
+g2 <- load_all_results(OUT_DIR2, min_L = 0)
+
+all_res <- if(!is.null(g2)) rbind(g1, g2) else g1
+all_res <- all_res[order(-all_res$L), ]
+all_res$L_norm <- all_res$L / sum(all_res$L, na.rm=TRUE)
+saveRDS(all_res, file.path(OUT_DIR1, "glue_all.rds"))
+
+cat("Total runs:", nrow(all_res), "\n")
+cat("Behavioural (L > 0):", sum(all_res$L > 0, na.rm=TRUE), "\n")
+cat("\nBest parameter set:\n")
+best_p <- setNames(as.numeric(all_res[1, param_bounds$name]), param_bounds$name)
+print(round(best_p, 6))
+cat(sprintf("L=%.4f  KGE=%.3f  log-NSE=%.3f  CSI=%.3f  Acc=%.3f  Bias=%.3f\n",
+            all_res$L[1], all_res$kge[1], all_res$lnse[1],
+            all_res$csi[1], all_res$accuracy[1], all_res$bias[1]))
+
+# ── Best run plot ──────────────────────────────────────────────────────────────
+best_sim <- run_model(best_p)
+if(!is.null(best_sim)){
+  plot(merge(obs_q, best_sim[,"q_out"]),
+       main = "Best run (highest likelihood)",
+       col  = c("black","firebrick"), legend.loc = "topright")
+}
+
+# ── Best KGE run plot ─────────────────────────────────────────────────────────
+best_kge_row <- all_res[which.max(all_res$kge), ]
+cat(sprintf("L=%.4f  KGE=%.3f  log-NSE=%.3f  CSI=%.3f  Acc=%.3f  Bias=%.3f\n",
+            best_kge_row$L[1], best_kge_row$kge[1], best_kge_row$lnse[1],
+            best_kge_row$csi[1], best_kge_row$accuracy[1], best_kge_row$bias[1]))
+best_kge_p   <- setNames(as.numeric(best_kge_row[, param_bounds$name]),
+                          param_bounds$name)
+best_kge_sim <- run_model(best_kge_p)
+if(!is.null(best_kge_sim)){
+  plot(merge(obs_q, best_kge_sim[,"q_out"]),
+       main = "Best KGE run",
+       col  = c("black","firebrick"), legend.loc = "topright")
+}
+
+# ── Dotty plots ───────────────────────────────────────────────────────────────
+behav_all <- all_res[all_res$L > 0 & !is.na(all_res$L), ]
+if(nrow(behav_all) > 0){
+  plot_dotty(all_res, param_bounds, metric = "L")
+} else {
+  cat("No behavioural runs for dotty plots — lower KGE_THRESH and rerun.\n")
+}
+```
+
+
+```{r}
+#plot of KGE or NSE vs accuracy and CSI
+all_res %>% 
+  tibble() %>% 
+  ggplot()+
+  geom_point(aes(x = kge, y = accuracy))+
+  theme_classic()
+
+
+all_res %>% 
+  tibble() %>% 
+  ggplot()+
+  geom_point(aes(x = kge, y = csi))+
+  theme_classic()
+
+all_res %>% 
+  tibble() %>% 
+  ggplot()+
+  geom_point(aes(x = kge, y = nse))+
+  theme_classic()
 ```
 
 
@@ -2892,16 +2696,85 @@ kge(test_sim[,1], obs_sim)
 # Figure 1: Spatial map of per-sensor accuracy
 # =============================================================================
 
-library(ggplot2)
-library(terra)
-library(tidyverse)
-library(sf)
+# take best sim, and make it into format matching my actual observations, then can compare using functions I have previously written
+
+pa_sim <- 
+  data.frame(date=index(best_sim), coredata(best_sim)) %>% 
+   tibble() %>% 
+   select(-q_out) %>% 
+   pivot_longer(-date) %>% 
+   mutate(hru_id = as.integer(substr(name, 9, 11))) %>%
+   select(-name) %>%
+   left_join(sensor_hru_key, by = "hru_id") %>% 
+   mutate(modeled = case_when(value <= SZ_THRESHOLD ~ 1,
+                             value > SZ_THRESHOLD ~ 0)) %>% 
+   rename(datetime = date) %>% 
+   select(datetime, hru_id, sensor_id, modeled)
+
+
+   
+ # instead of filtering date times to match my obs, just do big left join by ID and date
+joined <- pa_obs %>% 
+  left_join(pa_sim, by = c("datetime", "hru_id"))
+
+joined %>% 
+filter(if_any(everything(), is.na))
+
+get_eval_label <- function(true, pred) {
+  if (true == 1 && pred == 1) return("correct")
+  if (true == 0 && pred == 0) return("correct")
+  if (true == 1 && pred == 0) return("omission")
+  if (true == 0 && pred == 1) return("commission")
+}
+
+get_eval_label(0,0)
+joined$eval <- mapply(get_eval_label, joined$observed, joined$modeled)
+
+joined %>% 
+  group_by(eval) %>% 
+  summarise(count = n())
+ggplot(joined)+
+  geom_bar(aes(x = ))
+## Plot that is just a single row
+ID_acc_w3 <- joined %>%
+    #inner_join(fb_limbs, by = "datetime") %>% 
+  group_by(sensor_id) %>%
+  summarize(
+    correct = sum(eval == "correct"),
+    total = n(),
+    #cheap_accuracy = cheap_correct / total,
+    accuracy = correct/total
+  ) %>%
+  select(sensor_id, accuracy)
+
+spatial_acc_sf <- 
+  locs %>% 
+  rename(sensor_id = number) %>% 
+  #left_join(sensor_hru_key, by = "sensor_id") %>% 
+  left_join(ID_acc_w3, by = "sensor_id") %>% 
+  st_as_sf()
+
+W3_rot <- ggplot()+
+  theme_void()+
+  geom_sf(data = w3_outline, fill = NA, color = "#FFD166", alpha = 0.3, lwd = 1)+
+  geom_sf(data = w3_net, colour = "grey", lwd = 1) +
+geom_sf(data = w3_stic_locs_r %>% inner_join(ID_acc_w3, by = "ID"), 
+        aes(fill = accuracy), size = 3, pch = 21) +
+  scale_fill_gradientn(colors = c("white","lightgrey","darkgrey", "black"))+
+  #scale_shape_manual(values = c(21, 24, 22))+
+  theme(rect = element_rect(fill = "transparent", color = NA),
+        legend.position = "none",
+        #strip.text.x = element_blank()
+        )+
+  facet_grid( ~ model)
+W3_rot
+
 
 # ── Compute per-sensor accuracy from best_sim ─────────────────────────────────
 compute_sensor_accuracy <- function(best_sim, pa_obs, 
-                                    threshold = FLOW_THRESHOLD){
+                                    threshold = 0.01){
   do.call(rbind, lapply(unique(pa_obs$hru_id), function(hid){
-    col_name <- paste0("q_sf_hru", hid)
+    col_name <- paste0("s_sz_hru", hid)
     if(!col_name %in% names(best_sim)) return(NULL)
     
     sub <- pa_obs[pa_obs$hru_id == hid, ]
@@ -2936,7 +2809,8 @@ compute_sensor_accuracy <- function(best_sim, pa_obs,
 }
 
 sensor_acc <- compute_sensor_accuracy(best_sim, pa_obs)
-locs
+locs <- vect(stic_locs_snapped)
+
 locs_df <- as.data.frame(stic_locs, geom = "XY") %>%
   rename(sensor_id = number, lon = x, lat = y) %>%
   group_by(sensor_id) %>%
@@ -2968,6 +2842,12 @@ spatial_acc_sf <- st_as_sf(spatial_acc,
 watershed_sf <- st_as_sf(w3_outline)     # adjust to your outline object
 channel_sf   <- st_as_sf(vect_final)
 
+spatial_acc_sf <- 
+  locs %>% 
+  rename(sensor_id = number) %>% 
+  left_join(sensor_hru_key, by = "sensor_id") %>% 
+  left_join(sensor_acc, by = "hru_id") %>% 
+  st_as_sf()
 # ── Plot ──────────────────────────────────────────────────────────────────────
 fig1 <- ggplot() +
   geom_sf(data = watershed_sf, fill = "grey96", color = "grey60",
@@ -2992,7 +2872,7 @@ fig1 <- ggplot() +
   # Label each point with sensor id and accuracy %
   ggrepel::geom_label_repel(
     data = spatial_acc_sf,
-    aes(label = paste0(sensor_id, "\n",
+    aes(label = paste0(#sensor_id, "\n",
                         scales::percent(accuracy, accuracy = 1)),
         geometry = geometry),
     stat         = "sf_coordinates",
@@ -3006,23 +2886,23 @@ fig1 <- ggplot() +
   ) +
   coord_sf() +
   labs(
-    title    = "Flow presence/absence accuracy by sensor location",
-    subtitle = paste0("Calibration period  ",
-                       format(cal_start, "%Y-%m-%d"), " — ",
-                       format(cal_end,   "%Y-%m-%d")),
-    caption  = paste0("Threshold: ", FLOW_THRESHOLD, " m³/s  |  ",
-                       "n = observations per site")
+    #title    = "Flow presence/absence accuracy by sensor location",
+    # subtitle = paste0("Calibration period  ",
+    #                    format(cal_start, "%Y-%m-%d"), " — ",
+    #                    format(cal_end,   "%Y-%m-%d")),
+    y = "",
+    x = ""
   ) +
-  theme_minimal(base_size = 11) +
+  theme_void() +
   theme(
     plot.title    = element_text(size = 13, face = "bold"),
     plot.subtitle = element_text(color = "grey50"),
-    legend.position = "right",
-    panel.grid    = element_line(color = "grey92", linewidth = 0.3)
+    legend.position = "right"
+   # panel.grid    = element_line(color = "grey92", linewidth = 0.3)
   )
 
 print(fig1)
-ggsave("fig1_spatial_accuracy.png", fig1, scale = 2,
+ggsave("fig1_spatial_accuracy.png", fig1, scale = 1,
        dpi = 300, bg = "white")
 
 # =============================================================================
@@ -3033,11 +2913,12 @@ ggsave("fig1_spatial_accuracy.png", fig1, scale = 2,
 
 
 # Hydrograph data
-hydro_df <- data.frame(
+hydro_df <- 
+  data.frame(
   datetime = index(obs_q),
   q_obs    = as.numeric(obs_q),
   q_sim    = as.numeric(best_sim[index(obs_q), "q_out"])
-) %>%
+) #%>%
   filter(datetime >= min(rolling_acc$datetime, na.rm=TRUE),
          datetime <= max(rolling_acc$datetime, na.rm=TRUE))
 
@@ -3100,7 +2981,7 @@ compute_rolling_accuracy <- function(best_sim, pa_obs,
   # ── 3. For each HRU, pull simulated values and compute binned accuracy ───────
   all_results <- do.call(rbind, lapply(unique(pa_joined$hru_id), function(hid){
     
-    col_name <- paste0("q_sf_hru", hid)
+    col_name <- paste0("s_sf_hru", hid)
     if(!col_name %in% names(sim_df)) return(NULL)
     
     sub <- pa_joined %>%
@@ -3244,11 +3125,11 @@ ggsave("fig2_temporal_accuracy.png", fig2,
 ```
 
 ```{r}
-compute_rolling_accuracy <- function(best_sim, pa_obs,
-                                     threshold    = FLOW_THRESHOLD,
-                                     bin_days     = 14,      # width of each accuracy bin
-                                     join_tol_min = 20){     # max minutes to match obs to sim
-  
+# compute_rolling_accuracy <- function(best_sim, pa_obs,
+#                                      threshold    = FLOW_THRESHOLD,
+#                                      bin_days     = 14,      # width of each accuracy bin
+#                                      join_tol_min = 20){     # max minutes to match obs to sim
+  join_tol_min = 35
   # ── 1. Convert sim to data frame once — avoid repeated xts indexing ─────────
   sim_df <- data.frame(
     datetime = as.POSIXct(index(best_sim), tz = "UTC"),
@@ -3280,7 +3161,7 @@ compute_rolling_accuracy <- function(best_sim, pa_obs,
   # ── 3. For each HRU, pull simulated values and compute binned accuracy ───────
   all_results <- do.call(rbind, lapply(unique(pa_joined$hru_id), function(hid){
     
-    col_name <- paste0("q_sf_hru", hid)
+    col_name <- paste0("s_sf_hru", hid)
     if(!col_name %in% names(sim_df)) return(NULL)
     
     sub <- pa_joined %>%
@@ -3332,3 +3213,869 @@ rolling_acc <- compute_rolling_accuracy(
 )
 ```
 
+```{r}
+# =============================================================================
+# Results Visualisation — dynatop GLUE calibration
+# Four-panel figure constrained to PA observation windows:
+#   Panel 1 — Observed vs best-sim discharge + GLUE uncertainty band
+#   Panel 2 — Combined rolling accuracy + CSI through time
+#   Panel 3 — Per-site accuracy heatmap through time
+#   Panel 4 — Log-scale discharge (emphasises low flows / baseflow fit)
+# =============================================================================
+
+#library(dynatop)
+library(xts)
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(scales)
+library(readr)
+
+# =============================================================================
+# 1.  LOAD DATA — adapt paths to your setup
+# =============================================================================
+all_res  <- readRDS(file.path(".", "7th_attempt", "glue_results", "glue_all.rds"))
+obs_full <- readRDS(file.path(".", "7th_attempt", "obs.rds"))
+pa_obs   <- read_csv("./7th_attempt/pa_obs.csv", show_col_types = FALSE) %>%
+  mutate(datetime = as.POSIXct(datetime, tz = "UTC")) %>%
+  filter(lubridate::minute(datetime) == 0)
+
+# Assumes parameterisation_v2.R functions are already in the environment.
+# If not, source it:  source("parameterisation_v2.R")
+
+# =============================================================================
+# 2.  OBSERVATION WINDOWS
+# =============================================================================
+w1_start <- as.POSIXct("2023-07-01", tz = "UTC")
+w1_end   <- as.POSIXct("2023-11-30", tz = "UTC")
+w2_start <- as.POSIXct("2024-05-01", tz = "UTC")
+w2_end   <- as.POSIXct("2024-07-31", tz = "UTC")
+
+tag_period <- function(df, time_col = "datetime"){
+  df %>%
+    mutate(period = case_when(
+      .data[[time_col]] >= w1_start & .data[[time_col]] <= w1_end ~ "Jul–Nov 2023",
+      .data[[time_col]] >= w2_start & .data[[time_col]] <= w2_end ~ "May–Jul 2024",
+      TRUE ~ NA_character_
+    )) %>%
+    filter(!is.na(period)) %>%
+    mutate(period = factor(period, levels = c("Jul–Nov 2023", "May–Jul 2024")))
+}
+
+# Rebuild obs objects needed by run_model
+cal_start <- as.POSIXct("2021-01-01", tz = "UTC")
+cal_end   <- as.POSIXct("2024-11-26", tz = "UTC")
+spin_days <- 180L
+sim_start <- cal_start - spin_days * 86400
+obs_sim   <- obs_full[index(obs_full) >= sim_start & index(obs_full) <= cal_end, ]
+obs_q     <- obs_full[index(obs_full) >= cal_start & index(obs_full) <= cal_end,
+                       "Discharge_m3_s"]
+
+# =============================================================================
+# 3.  BEST-RUN SIMULATION
+# =============================================================================
+best_p <- setNames(as.numeric(all_res[1, param_bounds$name]), param_bounds$name)
+cat("Running best parameter set...\n")
+best_sim <- run_model(best_p, pa_hru_ids = sort(unique(pa_obs$hru_id)))
+stopifnot("Best simulation returned NULL" = !is.null(best_sim))
+
+# =============================================================================
+# 4.  GLUE UNCERTAINTY BANDS
+# =============================================================================
+behav <- all_res[all_res$L > 0 & !is.na(all_res$L), ]
+cat(sprintf("%d behavioural runs available\n", nrow(behav)))
+
+MAX_BEHAV <- 200L
+if(nrow(behav) > MAX_BEHAV){
+  set.seed(42)
+  behav <- behav[sample(nrow(behav), MAX_BEHAV,
+                         prob = behav$L_norm / sum(behav$L_norm, na.rm = TRUE)), ]
+  cat(sprintf("Sampled %d runs for uncertainty bands\n", MAX_BEHAV))
+}
+
+cat("Re-running behavioural sets for uncertainty...\n")
+sim_q_list <- lapply(seq_len(nrow(behav)), function(i){
+  p <- setNames(as.numeric(behav[i, param_bounds$name]), param_bounds$name)
+  tryCatch({
+    s <- run_model(p)
+    if(is.null(s)) return(NULL)
+    as.numeric(s[, "q_out"])
+  }, error = function(e) NULL)
+})
+
+good    <- !sapply(sim_q_list, is.null)
+sims    <- sim_q_list[good]
+L_w     <- behav$L_norm[good]
+L_w     <- L_w / sum(L_w, na.rm = TRUE)
+sim_mat <- do.call(cbind, sims)
+sim_idx <- index(best_sim)
+
+wq <- function(row, probs, w){
+  ord <- order(row)
+  cw  <- cumsum(w[ord])
+  sapply(probs, function(p) row[ord][which(cw >= p)[1]])
+}
+
+cat("Computing weighted quantiles...\n")
+q_bounds <- t(apply(sim_mat, 1, wq, probs = c(0.05, 0.25, 0.75, 0.95), w = L_w))
+q_mean   <- apply(sim_mat, 1, weighted.mean, w = L_w)
+
+# Build obs_q aligned to sim timestamps
+obs_q_aligned <- as.numeric(
+  merge(xts(rep(NA_real_, length(sim_idx)), sim_idx), obs_q, join = "left")[, 2]
+)
+
+hydro_df <- data.frame(
+  datetime = as.POSIXct(sim_idx, tz = "UTC"),
+  q_obs    = obs_q_aligned,
+  q_best   = as.numeric(best_sim[, "q_out"]),
+  q_mean   = q_mean,
+  q05      = q_bounds[, 1],
+  q25      = q_bounds[, 2],
+  q75      = q_bounds[, 3],
+  q95      = q_bounds[, 4]
+) %>%
+  tag_period("datetime")
+
+# =============================================================================
+# 5.  ROLLING ACCURACY
+# =============================================================================
+BIN_DAYS <- 3L
+
+compute_accuracy_bins <- function(best_sim, pa_obs,
+                                   sz_threshold = SZ_THRESHOLD,
+                                   bin_days = BIN_DAYS){
+  sim_df <- data.frame(
+    datetime = as.POSIXct(index(best_sim), tz = "UTC"),
+    as.data.frame(coredata(best_sim))
+  )
+
+  pa_joined <- pa_obs %>%
+    mutate(datetime = as.POSIXct(datetime, tz = "UTC")) %>%
+    mutate(
+      idx      = findInterval(as.numeric(datetime),
+                               as.numeric(sim_df$datetime)),
+      idx      = pmax(1L, pmin(idx, nrow(sim_df))),
+      sim_time = sim_df$datetime[idx],
+      gap_secs = abs(as.numeric(datetime) - as.numeric(sim_time))
+    ) %>%
+    filter(gap_secs <= 1800)
+
+  if(nrow(pa_joined) == 0){
+    cat("Warning: no PA observations matched to simulation timesteps\n")
+    return(NULL)
+  }
+
+  do.call(rbind, lapply(unique(pa_joined$hru_id), function(hid){
+    col <- paste0("s_sz_hru", hid)
+    if(!col %in% names(sim_df)) return(NULL)
+
+    sub <- pa_joined %>%
+      filter(hru_id == hid) %>%
+      mutate(
+        sim_sz  = sim_df[[col]][idx],
+        sim_bin = as.integer(sim_sz <= sz_threshold),
+        obs_bin = as.integer(observed),
+        bin_mid = as.POSIXct(
+          floor(as.numeric(datetime) / (bin_days * 86400)) * (bin_days * 86400) +
+            (bin_days * 86400 / 2),
+          origin = "1970-01-01", tz = "UTC"
+        )
+      ) %>%
+      filter(!is.na(sim_bin), !is.na(obs_bin))
+
+    if(nrow(sub) == 0) return(NULL)
+
+    sub %>%
+      group_by(hru_id, bin_mid) %>%
+      summarise(
+        TP = sum(sim_bin == 1L & obs_bin == 1L),
+        FP = sum(sim_bin == 1L & obs_bin == 0L),
+        FN = sum(sim_bin == 0L & obs_bin == 1L),
+        TN = sum(sim_bin == 0L & obs_bin == 0L),
+        n  = n(),
+        .groups = "drop"
+      ) %>%
+      mutate(
+        accuracy = (TP + TN) / (TP + FP + FN + TN),
+        CSI      = ifelse((TP + FP + FN) > 0, TP / (TP + FP + FN), NA_real_),
+        datetime = bin_mid
+      ) %>%
+      filter(n >= 3)
+  }))
+}
+
+cat("Computing rolling accuracy...\n")
+acc_df <- compute_accuracy_bins(best_sim, pa_obs)
+stopifnot("Accuracy computation failed — check PA data alignment" = !is.null(acc_df))
+acc_df <- tag_period(acc_df, "datetime")
+
+# Combined across all sites
+acc_combined <- acc_df %>%
+  group_by(datetime, period) %>%
+  summarise(
+    TP = sum(TP), FP = sum(FP), FN = sum(FN), TN = sum(TN),
+    n  = sum(n),
+    accuracy = (TP + TN) / (TP + FP + FN + TN),
+    CSI      = ifelse((TP + FP + FN) > 0, TP / (TP + FP + FN), NA_real_),
+    .groups = "drop"
+  )
+
+# =============================================================================
+# 6.  SITE LABELS  (upstream → downstream order by HRU id)
+# =============================================================================
+hids <- sort(unique(acc_df$hru_id), decreasing = TRUE)   # high id = upstream in dynatop
+site_labels <- if(exists("sensor_hru_map")){
+  map_df <- sensor_hru_map[match(hids, sensor_hru_map$hru_id), ]
+  setNames(paste0("Site ", map_df$sensor_id, " (HRU ", hids, ")"),
+            as.character(hids))
+} else {
+  setNames(paste0("HRU ", hids), as.character(hids))
+}
+
+acc_df <- acc_df %>%
+  mutate(site = factor(site_labels[as.character(hru_id)],
+                        levels = site_labels))
+
+# =============================================================================
+# 7.  THEME & COLOURS
+# =============================================================================
+clr_obs    <- "#1B2A41"
+clr_best   <- "#CC2936"
+clr_mean   <- "#3A86FF"
+clr_band95 <- "#AED9E0"
+clr_band50 <- "#5BC0EB"
+clr_acc    <- "#0077B6"
+clr_csi    <- "#E94560"
+
+base_theme <- function(){
+  theme_minimal(base_size = 10) +
+    theme(
+      plot.title       = element_text(size = 10, face = "bold", colour = "#1B2A41",
+                                       margin = margin(b = 3)),
+      plot.subtitle    = element_text(size = 8, colour = "grey50",
+                                       margin = margin(b = 4)),
+      axis.title       = element_text(size = 9, colour = "grey35"),
+      axis.text        = element_text(size = 7.5, colour = "grey45"),
+      axis.text.x      = element_text(angle = 0, hjust = 0.5),
+      panel.grid.major = element_line(colour = "grey93", linewidth = 0.3),
+      panel.grid.minor = element_blank(),
+      strip.text       = element_text(size = 8.5, face = "bold", colour = "#1B2A41",
+                                       margin = margin(b = 4, t = 4)),
+      strip.background = element_rect(fill = "grey97", colour = "grey88"),
+      legend.position  = "bottom",
+      legend.key.size  = unit(0.45, "cm"),
+      legend.text      = element_text(size = 7.5),
+      legend.title     = element_text(size = 8, face = "bold"),
+      legend.margin    = margin(t = 2),
+      panel.spacing.x  = unit(0.8, "lines"),
+      plot.margin      = margin(5, 8, 3, 8)
+    )
+}
+
+x_scale_free <- scale_x_datetime(
+  date_breaks  = "1 month",
+  date_labels  = "%b\n%Y",
+  expand       = expansion(mult = 0.03)
+)
+
+# =============================================================================
+# 8.  PANEL 1 — Hydrograph with uncertainty band
+# =============================================================================
+p1 <- ggplot(hydro_df, aes(x = datetime)) +
+  geom_ribbon(aes(ymin = q05, ymax = q95, fill = "90% band"), alpha = 0.35) +
+  geom_ribbon(aes(ymin = q25, ymax = q75, fill = "50% band"), alpha = 0.55) +
+  geom_line(aes(y = q_mean,  colour = "Ensemble mean"),
+            linewidth = 0.55, linetype = "31") +
+  geom_line(aes(y = q_best,  colour = "Best run"),
+            linewidth = 0.75) +
+  geom_line(aes(y = q_obs,   colour = "Observed"),
+            linewidth = 0.85, na.rm = TRUE) +
+  facet_wrap(~ period, scales = "free_x", nrow = 1) +
+  scale_fill_manual(
+    name   = NULL,
+    values = c("90% band" = clr_band95, "50% band" = clr_band50),
+    guide  = guide_legend(order = 3, override.aes = list(alpha = 0.7))
+  ) +
+  scale_colour_manual(
+    name   = NULL,
+    values = c("Observed" = clr_obs, "Best run" = clr_best,
+               "Ensemble mean" = clr_mean),
+    guide  = guide_legend(order = 1,
+                           override.aes = list(linewidth = 1.2))
+  ) +
+  scale_y_continuous(
+    labels = label_number(#suffix = " m³/s", 
+                          accuracy = 0.1),
+    limits = c(0, 0.3),
+    expand = expansion(mult = c(0, 0.06))
+  ) +
+  x_scale_free +
+  labs(
+    y        = "Q [m³/s]",
+    x        = NULL,
+    title    = "Observed vs simulated discharge",
+    subtitle = sprintf(
+      "GLUE uncertainty (%d behavioural runs weighted by likelihood)  |  Best: KGE = %.3f, log-NSE = %.3f, Acc = %.3f",
+      sum(good), all_res$kge[1], all_res$lnse[1], all_res$accuracy[1]
+    )
+  ) +
+  base_theme()+
+  theme(legend.position = "none")
+p1
+# =============================================================================
+# 9.  PANEL 2 — Combined accuracy + CSI through time
+# =============================================================================
+acc_long <- acc_combined %>%
+  pivot_longer(c(accuracy, CSI), names_to = "metric", values_to = "value") %>%
+  mutate(metric = recode(metric,
+                          accuracy = "Accuracy",
+                          CSI      = "CSI"))
+
+p2 <- ggplot(acc_long, aes(x = datetime)) +
+  geom_hline(yintercept = 0.5, linetype = "22",
+             colour = "grey70", linewidth = 0.4) +
+  geom_line(aes(y = value, colour = metric), linewidth = 0.8, na.rm = TRUE) +
+  geom_point(aes(y = value, colour = metric, size = metric),
+             na.rm = TRUE) +
+  # n labels below x-axis area
+  geom_text(
+    data    = acc_combined,
+    aes(x = datetime, y = -0.07, label = n),
+    size    = 2.3,
+    colour  = "grey55",
+    inherit.aes = FALSE
+  ) +
+  annotate("text", x = w1_start + (w1_end - w1_start) * 0.01,
+           y = -0.12, label = "n observations per bin",
+           hjust = 0, size = 2.3, colour = "grey60") +
+  facet_wrap(~ period, scales = "free_x", nrow = 1) +
+  scale_colour_manual(
+    name   = "Metric",
+    values = c("Accuracy" = clr_acc, "CSI" = clr_csi),
+    labels = c("Accuracy  (TP+TN) / all", "CSI  TP / (TP+FP+FN)")
+  ) +
+  scale_size_manual(values = c("Accuracy" = 2.2, "CSI" = 2.2), guide = "none") +
+  scale_y_continuous(
+    limits = c(-0.15, 1.05),
+    breaks = c(0, 0.25, 0.5, 0.75, 1.0),
+    labels = percent_format(accuracy = 1)
+  ) +
+  x_scale_free +
+  labs(
+    y        = "Score",
+    x        = NULL,
+    title    = "Flow presence/absence — all sites combined",
+    subtitle = sprintf(
+      "%d-day calendar bins  |  s_sz ≤ %.2f m → flowing  |  n = total observations per bin",
+      BIN_DAYS, SZ_THRESHOLD
+    )
+  ) +
+  base_theme()
+
+# =============================================================================
+# 10.  PANEL 3 — Per-site accuracy heatmap
+# =============================================================================
+p3 <- ggplot(acc_df, aes(x = datetime, y = site, fill = accuracy)) +
+  geom_tile(colour = "white", linewidth = 0.4, na.rm = TRUE) +
+  geom_text(
+    data = acc_df %>% filter(n < 5),
+    aes(label = "?"),
+    size = 2, colour = "white", na.rm = TRUE
+  ) +
+  facet_wrap(~ period, scales = "free_x", nrow = 1) +
+  scale_fill_gradientn(
+    colours = c("#e74c3c", "#f39c12", "#f1c40f", "#2ecc71"),
+    values  = rescale(c(0, 0.4, 0.65, 1)),
+    limits  = c(0, 1),
+    name    = "Accuracy",
+    labels  = percent_format(accuracy = 1),
+    guide   = guide_colourbar(
+      barwidth    = 10,
+      barheight   = 0.5,
+      title.position = "top",
+      title.hjust    = 0.5
+    )
+  ) +
+  x_scale_free +
+  labs(
+    y        = NULL,
+    x        = NULL,
+    title    = "Per-site accuracy",
+    subtitle = "? = fewer than 5 observations in bin  |  sites ordered upstream (top) to downstream (bottom)"
+  ) +
+  base_theme() +
+  theme(
+    axis.text.y     = element_text(size = 7),
+    panel.grid      = element_blank(),
+    legend.position = "bottom"
+  )
+
+# =============================================================================
+# 11.  PANEL 4 — Log-scale discharge
+# =============================================================================
+eps <- 1e-5  # floor to avoid log(0)
+
+p4 <- ggplot(hydro_df, aes(x = datetime)) +
+  geom_ribbon(
+    aes(ymin = pmax(q05, eps), ymax = pmax(q95, eps), fill = "90% band"),
+    alpha = 0.35
+  ) +
+  geom_ribbon(
+    aes(ymin = pmax(q25, eps), ymax = pmax(q75, eps), fill = "50% band"),
+    alpha = 0.55
+  ) +
+  geom_line(aes(y = pmax(q_mean, eps),  colour = "Ensemble mean"),
+            linewidth = 0.55, linetype = "31") +
+  geom_line(aes(y = pmax(q_best, eps), colour = "Best run"),
+            linewidth = 0.75, na.rm = TRUE) +
+  geom_line(aes(y = pmax(q_obs,  eps), colour = "Observed"),
+            linewidth = 0.85, na.rm = TRUE) +
+  facet_wrap(~ period, scales = "free_x", nrow = 1) +
+  scale_fill_manual(
+    name   = NULL,
+    values = c("90% band" = clr_band95, "50% band" = clr_band50),
+    guide  = guide_legend(order = 2, override.aes = list(alpha = 0.7))
+  ) +
+  scale_colour_manual(
+    name   = NULL,
+    values = c("Observed" = clr_obs, "Best run" = clr_best,
+               "Ensemble mean" = clr_mean),
+    guide  = guide_legend(order = 1, override.aes = list(linewidth = 1.2))
+  ) +
+  scale_y_log10(
+    labels = label_number(accuracy = 0.0001),
+    expand = expansion(mult = c(0.02, 0.06))
+  ) +
+  x_scale_free +
+  labs(
+    y        = "log(Q) [m³/s] (log scale)",
+    x        = NULL#,
+    #title    = "Log-scale discharge — low-flow and baseflow fit",
+    #subtitle = sprintf("Floor at %.0e m³/s to avoid log(0)", eps)
+  ) +
+  base_theme()+
+  theme(strip.text = element_blank())
+
+p4
+# =============================================================================
+# 12.  ASSEMBLE FIGURE
+# =============================================================================
+# Heights proportional to content: hydro panels slightly taller than accuracy
+n_sites  <- length(unique(acc_df$hru_id))
+fig <- (p1 / p2 / p3 / p4) +
+  plot_layout(heights = c(2.5, 1.8, 0.6 * n_sites, 2.0)) +
+  plot_annotation(
+    title   = "dynatop GLUE calibration results",
+    subtitle = paste0(
+      "Watershed: W3  |  ",
+      sprintf("Calibration: %s – %s  |  ", format(cal_start, "%Y-%m-%d"),
+               format(cal_end,   "%Y-%m-%d")),
+      sprintf("Soil groups: 3  |  Parameters: %d  |  Total GLUE runs: %d",
+               N_PARAMS, nrow(all_res))
+    ),
+    theme = theme(
+      plot.title    = element_text(size = 13, face = "bold", colour = "#1B2A41",
+                                    margin = margin(b = 4)),
+      plot.subtitle = element_text(size = 9, colour = "grey50",
+                                    margin = margin(b = 8)),
+      plot.margin   = margin(10, 10, 10, 10)
+    )
+  )
+p1
+p2
+p3
+p4
+p1/p4
+p2/p3
+ggsave("discharge_acc.png", scale = 2)
+# =============================================================================
+# 13.  SAVE
+# =============================================================================
+fig_height <- 4 + 3 + 0.45 * n_sites + 3.5   # inches
+
+ggsave(
+  filename = "./7th_attempt/results_figure.png",
+  plot     = fig,
+  width    = 14,
+  height   = fig_height,
+  dpi      = 300,
+  bg       = "white"
+)
+
+ggsave(
+  filename = "./7th_attempt/results_figure.pdf",
+  plot     = fig,
+  width    = 14,
+  height   = fig_height,
+  device   = cairo_pdf
+)
+
+cat(sprintf("\nFigure saved (%.1f × %.1f inches)\n", 14, fig_height))
+print(fig)
+
+# =============================================================================
+# 14.  SUMMARY STATISTICS
+# =============================================================================
+cat("\n=== Performance summary ===\n")
+cat(sprintf("KGE:        %.3f\n", all_res$kge[1]))
+cat(sprintf("log-NSE:    %.3f\n", all_res$lnse[1]))
+cat(sprintf("CSI:        %.3f\n", all_res$csi[1]))
+cat(sprintf("Accuracy:   %.3f\n", all_res$accuracy[1]))
+cat(sprintf("Bias:       %.3f\n", all_res$bias[1]))
+cat(sprintf("Likelihood: %.4f\n", all_res$L[1]))
+
+cat("\nPer-site accuracy (best run, full PA period):\n")
+pa_full <- pa_metrics(best_sim, pa_obs)
+cat(sprintf("  Combined — CSI=%.3f  Acc=%.3f  TP=%d FP=%d FN=%d TN=%d\n",
+            pa_full$CSI, pa_full$accuracy,
+            pa_full$TP, pa_full$FP, pa_full$FN, pa_full$TN))
+```
+
+## Figure 1
+```{r}
+ctch$get_layer
+ctch$plot_layer("atb_20")
+ctch$plot_layer("soil")
+
+soil_rast <- ctch$get_layer("soil")
+twi_rast <- ctch$get_layer("atb_20")
+plot(soil_rast)
+plot(twi_rast)
+
+# channel HRUs
+ctch$plot_layer("channel")
+
+ctch$plot_layer("atb20_soil")
+
+
+ctch$combine_classes("atb20_soil",c("atb_20","soil"))
+ctch$plot_layer("atb20_soil")
+
+# Make a figure combining all of this information
+```
+
+```{r}
+# boxplot of depths for each soil class
+plot(mask_soil)
+original_soil <- ggplot() +
+    geom_spatraster(data = (mask_soil))+
+scale_fill_manual(values = colors,
+                  labels = soil_names,
+                  na.value = NA)+
+  theme_void()+
+      geom_sf(data = w3_outline, colour = "black", lwd = 1, fill = NA) +
+  labs(title = "Soil Hydropedological units in W3")
+
+plot(depth)
+plot(soil_ext)
+
+zonal(depth_ext, soil_ext, fun = "mean")
+zonal(depth_ext, soil_ext, fun = "median")
+zonal(depth_ext, soil_ext, fun = "min")
+zonal(depth_ext, soil_ext, fun = "max")
+
+# get the actual values
+extracted_values <- depth_ext[soil_ext == 1]
+
+
+one <- tibble("ID" = 1,
+  "depth" = c(depth_ext[soil_ext == 1]))
+  
+two <- tibble("ID" = 2,
+  "depth" = c(depth_ext[soil_ext == 2])) %>% 
+   bind_rows(one)
+three <- tibble("ID" = 3,
+  "depth" = c(depth_ext[soil_ext == 3])) %>% 
+  bind_rows(two)
+
+three %>% 
+ggplot()+
+  geom_boxplot(aes(x = ID, y = depth, group = ID))
+
+hist(three$depth)
+
+```
+
+```{r}
+# also plot the states
+ctch_mdl$plot_state("s_sz")
+ctch_mdl$plot_state("s_uz")
+
+
+```
+
+```{r}
+# make a plot of the grid of presenece/absence through time
+```
+```{r}
+pa_obs
+start_23 <- ymd_hms("2023-7-20 00:00:00")
+stop_23 <- ymd_hms("2023-10-22 00:00:00")
+
+binary_colors <- c("#DB995A", "#586BA4")
+SZ_THRESHOLD <- 0
+pa_sim <- 
+  data.frame(date=index(best_sim), coredata(best_sim)) %>% 
+   tibble() %>% 
+   select(-q_out) %>% 
+   pivot_longer(-date) %>% 
+   mutate(hru_id = as.integer(substr(name, 9, 11))) %>%
+   select(-name) %>%
+   left_join(sensor_hru_key, by = "hru_id") %>% 
+   mutate(modeled = case_when(value <= SZ_THRESHOLD ~ 1,
+                             value > SZ_THRESHOLD ~ 0)) %>% 
+   rename(datetime = date) %>% 
+   select(datetime, hru_id, sensor_id, modeled)
+
+just_period <- hydro_df %>% 
+  select(datetime, period)
+   
+ # instead of filtering date times to match my obs, just do big left join by ID and date
+joined <- pa_obs %>% 
+  left_join(pa_sim, by = c("datetime", "hru_id")) %>% 
+  left_join(just_period, by = "datetime")
+
+observed_plot <- joined %>% 
+  ggplot(aes(x = datetime))+
+  geom_tile(aes(y = sensor_id, fill = as.character(observed)))+
+  scale_y_continuous("Observed STIC flowing state")+
+  scale_fill_manual(drop = FALSE,
+                     values = binary_colors,
+                    breaks = c(0, 1),
+                    labels = c("Dry", "Wet"),
+                    name = ""
+                    )+
+    labs(x = "")+
+
+    facet_wrap(~ period, scales = "free_x", nrow = 1) +
+  theme_classic()+
+    theme(legend.position="right",
+          axis.title.y = element_text(angle = 90))
+
+modeled_plot <- joined %>% 
+  ggplot(aes(x = datetime))+
+  geom_tile(aes(y = sensor_id, fill = as.character(modeled)))+
+  scale_y_continuous("Modeled STIC flowing state")+
+  scale_fill_manual(drop = FALSE,
+                     values = binary_colors,
+                    breaks = c(0, 1),
+                    labels = c("Dry", "Wet"),
+                    name = ""
+                    )+
+    facet_wrap(~ period, scales = "free_x", nrow = 1) +
+  labs(x = "")+
+  theme_classic()+
+    theme(legend.position="right",
+          axis.title.y = element_text(angle = 90))
+
+
+## make another one that shows where it was right, and where there was commission and ommission error
+# 0 = correct
+# 1 = Ommission
+# -1 = Commission
+errors <- joined %>% 
+  mutate(type = observed - modeled) %>% 
+  ggplot(aes(x = datetime))+
+  geom_tile(aes(y = sensor_id, fill = as.character(type)))+
+  scale_y_continuous("STIC error type")+
+  scale_fill_manual(drop = FALSE,
+                     values = c("lightblue", "black", "firebrick"),
+                    breaks = c(-1, 0, 1),
+                    labels = c("Commission", "Correct", "Ommision"),
+                    name = ""
+                    )+
+    facet_wrap(~ period, scales = "free_x", nrow = 1) +
+  labs(x = "")+
+  theme_classic()+
+    theme(legend.position="right",
+          axis.title.y = element_text(angle = 90))
+
+combined_tiles <- observed_plot / modeled_plot / errors + plot_layout(guides = "collect")
+
+
+ggsave("figure6.png", dpi = 300, scale = 1.2, height = 10, width = 10)
+
+```
+
+
+# PAPER FIGURES
+```{r figure 4}
+# hydrograph, in normal and log scale, with different lines for actual, observed, and confidence intervals
+```
+```{r figure 5}
+# observed proportion of stic sensors flowing versus modeled
+
+# ── Build the network extent data frame ──────────────────────────────────────
+network_df <- joined %>%
+  group_by(datetime) %>%
+  summarise(
+    observed = mean(observed, na.rm = TRUE),
+    modeled  = mean(modeled,  na.rm = TRUE),
+    n_sites  = sum(!is.na(observed) & !is.na(modeled)),
+    .groups  = "drop"
+  ) %>%
+  filter(!is.na(observed), !is.na(modeled)) %>%
+  mutate(
+    season = case_when(
+      month(datetime) %in% c(12, 1, 2)  ~ "Winter",
+      month(datetime) %in% c(3,  4, 5)  ~ "Spring",
+      month(datetime) %in% c(6,  7, 8)  ~ "Summer",
+      month(datetime) %in% c(9, 10, 11) ~ "Autumn"
+    ),
+    season = factor(season, levels = c("Spring","Summer","Autumn","Winter"))
+  )
+
+# ── Base plot ─────────────────────────────────────────────────────────────────
+p <- ggplot(network_df, aes(x = observed, y = modeled)) +
+
+
+  # Points — jittered to separate discrete fractions, sized by site count
+  geom_jitter(aes(colour=season),
+              width=0.015, height=0.015, alpha=0.5, size = 4) +
+
+# LOESS smoother — reveals systematic bias across wetness states
+  geom_abline(aes(slope=1, intercept=0, linetype="1:1 line"),
+            colour="grey25", linewidth=0.7) +
+geom_smooth(aes(linetype="LOESS smoother"),
+            method="loess", span=0.8,
+            colour="grey20", fill="grey80",
+            linewidth=0.9, se=TRUE, alpha=0.3) +
+
+scale_linetype_manual(
+  name   = NULL,
+  values = c("1:1 line"       = "dashed",
+             "LOESS smoother" = "solid")
+)  +
+
+  # Scales
+  scale_colour_manual(
+    name   = "Season",
+    values = c("Spring" = "#52b788",
+               "Summer" = "#f4a261",
+               "Autumn" = "#e76f51",
+               "Winter" = "#457b9d")
+  ) +
+ 
+  scale_x_continuous(
+    labels = percent_format(accuracy=1),
+    limits = c(-0.02, 1.02),
+    expand = expansion(0)
+  ) +
+  scale_y_continuous(
+    labels = percent_format(accuracy=1),
+    limits = c(-0.02, 1.02),
+    expand = expansion(0)
+  ) +
+  labs(
+    x        = "Observed proportion of STICs flowing",
+    y        = "Modelled proportion of STICs flowing"#,
+  ) +
+  theme_classic(base_size = 11) +
+  theme(
+    plot.title    = element_text(face="bold", size=12),
+    plot.subtitle = element_text(size=8, colour="grey50",
+                                  margin=margin(b=8)),
+    legend.position  = "right",
+    legend.key.size  = unit(0.5, "cm"),
+    legend.text      = element_text(size=8),
+    legend.title     = element_text(size=8.5, face="bold")#,
+  )
+p
+
+ggsave("./7th_attempt/network_extent.png",
+       p, width=8, height=6, dpi=300, bg="white")
+```
+```{r figure 6}
+pa_obs
+start_23 <- ymd_hms("2023-7-20 00:00:00")
+stop_23 <- ymd_hms("2023-10-22 00:00:00")
+
+binary_colors <- c("#DB995A", "#586BA4")
+SZ_THRESHOLD <- 0
+pa_sim <- 
+  data.frame(date=index(best_sim), coredata(best_sim)) %>% 
+   tibble() %>% 
+   select(-q_out) %>% 
+   pivot_longer(-date) %>% 
+   mutate(hru_id = as.integer(substr(name, 9, 11))) %>%
+   select(-name) %>%
+   left_join(sensor_hru_key, by = "hru_id") %>% 
+   mutate(modeled = case_when(value <= SZ_THRESHOLD ~ 1,
+                             value > SZ_THRESHOLD ~ 0)) %>% 
+   rename(datetime = date) %>% 
+   select(datetime, hru_id, sensor_id, modeled)
+
+just_period <- hydro_df %>% 
+  select(datetime, period)
+   
+ # instead of filtering date times to match my obs, just do big left join by ID and date
+joined <- pa_obs %>% 
+  left_join(pa_sim, by = c("datetime", "hru_id")) %>% 
+  left_join(just_period, by = "datetime")
+
+observed_plot <- joined %>% 
+  ggplot(aes(x = datetime))+
+  geom_tile(aes(y = sensor_id, fill = as.character(observed)))+
+  scale_y_continuous("Observed STIC flowing state")+
+  scale_fill_manual(drop = FALSE,
+                     values = binary_colors,
+                    breaks = c(0, 1),
+                    labels = c("Dry", "Wet"),
+                    name = ""
+                    )+
+    labs(x = "")+
+
+    facet_wrap(~ period, scales = "free_x", nrow = 1) +
+  theme_classic()+
+    theme(legend.position="right",
+          axis.title.y = element_text(angle = 90))
+
+modeled_plot <- joined %>% 
+  ggplot(aes(x = datetime))+
+  geom_tile(aes(y = sensor_id, fill = as.character(modeled)))+
+  scale_y_continuous("Modeled STIC flowing state")+
+  scale_fill_manual(drop = FALSE,
+                     values = binary_colors,
+                    breaks = c(0, 1),
+                    labels = c("Dry", "Wet"),
+                    name = ""
+                    )+
+    facet_wrap(~ period, scales = "free_x", nrow = 1) +
+  labs(x = "")+
+  theme_classic()+
+    theme(legend.position="right",
+          axis.title.y = element_text(angle = 90))
+
+
+## make another one that shows where it was right, and where there was commission and ommission error
+# 0 = correct
+# 1 = Ommission
+# -1 = Commission
+errors <- joined %>% 
+  mutate(type = observed - modeled) %>% 
+  ggplot(aes(x = datetime))+
+  geom_tile(aes(y = sensor_id, fill = as.character(type)))+
+  scale_y_continuous("STIC error type")+
+  scale_fill_manual(drop = FALSE,
+                     values = c("lightblue", "black", "firebrick"),
+                    breaks = c(-1, 0, 1),
+                    labels = c("Commission", "Correct", "Ommision"),
+                    name = ""
+                    )+
+    facet_wrap(~ period, scales = "free_x", nrow = 1) +
+  labs(x = "")+
+  theme_classic()+
+    theme(legend.position="right",
+          axis.title.y = element_text(angle = 90))
+
+combined_tiles <- observed_plot / modeled_plot / errors + plot_layout(guides = "collect")
+
+
+ggsave("figure6.png", dpi = 300, scale = 1.2, height = 10, width = 10)
+
+```
+
+# FINAL TABLES
